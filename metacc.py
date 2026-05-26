@@ -25,14 +25,6 @@ try:
 except ImportError:
     _CLANG_AVAILABLE = False
 
-# 跨平台动态库后缀自动匹配
-if sys.platform.startswith("win"):
-    LIB_EXT = ".dll"
-elif sys.platform == "darwin":
-    LIB_EXT = ".dylib"
-else:
-    LIB_EXT = ".so"
-
 CACHE_VERSION   = 7
 TEMPLATE_AUTHOR = "houyuwenE@outlook.com"
 TEMPLATE_YEAR   = str(datetime.date.today().year)
@@ -43,62 +35,38 @@ RESOLVED_LIBCLANG_PATH = None
 
 
 def configure_and_verify_libclang(explicit_path: str | None = None) -> None:
-    """配置并校验 libclang 是否可用。"""
+    """配置并校验 libclang 环境。依赖环境由 pyproject.toml 保证，不再执行冗余的本地文件深度搜寻。"""
     global RESOLVED_LIBCLANG_PATH
     if not _CLANG_AVAILABLE:
-        print_libclang_missing_help("Python 'clang' package is not installed.")
+        print("[metacc] CRITICAL ERROR: Python 'clang' package is not installed.", file=sys.stderr)
         sys.exit(1)
 
-    if explicit_path:
-        candidates = [pathlib.Path(explicit_path)]
-    else:
-        candidates = []
-        # 1. 优先尊重用户显式配置的环境变量
-        env_path = os.getenv("METACC_LIBCLANG")
-        if env_path:
-            candidates.append(pathlib.Path(env_path))
-
-        # 2. 扁平化架构适配：直接在当前可执行文件同级目录寻找
-        script_dir = pathlib.Path(__file__).resolve().parent
-        candidates.append(script_dir / f"libclang{LIB_EXT}")
-        # 兼容旧开发环境
-        candidates.append(script_dir / "lib" / f"libclang{LIB_EXT}")
-
-    resolved_file = None
-    for candidate in candidates:
-        if candidate.is_file():
-            resolved_file = candidate.resolve()
-            break
-
-    if not resolved_file:
-        try:
-            if not clang.Config.loaded:
+    # 优先尊重显式参数或用户环境变量
+    path = explicit_path or os.getenv("METACC_LIBCLANG")
+    if path:
+        resolved_file = pathlib.Path(path).resolve()
+        if resolved_file.is_file():
+            try:
+                if not clang.Config.loaded:
+                    clang.Config.set_library_file(str(resolved_file))
                 clang.Index.create()
-            RESOLVED_LIBCLANG_PATH = "SYSTEM_DEFAULT"
-            return
-        except Exception:
-            print_libclang_missing_help(
-                f"Could not find 'libclang{LIB_EXT}' in bin/ directory."
-            )
-            sys.exit(1)
+                RESOLVED_LIBCLANG_PATH = str(resolved_file)
+                return
+            except Exception as e:
+                print(f"[metacc] error: Failed to load explicit libclang at {resolved_file}: {e}", file=sys.stderr)
+                sys.exit(1)
 
+    # 默认信任 pyproject.toml 与系统底层标准的环境变量/动态库加载链
     try:
         if not clang.Config.loaded:
-            clang.Config.set_library_file(str(resolved_file))
             clang.Index.create()
-        RESOLVED_LIBCLANG_PATH = str(resolved_file)
+        RESOLVED_LIBCLANG_PATH = "SYSTEM_DEFAULT"
     except Exception as e:
-        print(f"[metacc] error: Failed to load libclang at {resolved_file}: {e}", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(f"[metacc] CRITICAL ERROR: libclang runtime initialization failed: {e}", file=sys.stderr)
+        print("请检查系统是否正确安装了 LLVM/Clang 二进制运行库。", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
         sys.exit(1)
-
-
-def print_libclang_missing_help(reason: str) -> None:
-    print("=" * 80, file=sys.stderr)
-    print(f"[metacc] CRITICAL ERROR: libclang runtime initialization failed.", file=sys.stderr)
-    print(f"Reason: {reason}", file=sys.stderr)
-    print("-" * 80, file=sys.stderr)
-    print("确保 bin/ 目录下存在 libclang.so 即可完成自动加载。", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
 
 
 def _init_child_worker(libclang_path: str | None) -> None:
@@ -120,7 +88,7 @@ def _metacc_dir() -> pathlib.Path:
 
 
 METACC_DIR = _metacc_dir()
-METACC_H_NAME = "include/metacc.h"
+METACC_H_NAME = "metacc.h"
 METACC_ERROR_COUNT = 0
 
 
@@ -135,10 +103,6 @@ def resolve_project_root_arg(project_root_arg: str, cwd: pathlib.Path | None = N
     cwd = (cwd or pathlib.Path.cwd()).resolve()
     warnings: list[str] = []
 
-    # Try resolving relative project-root against a sensible list of anchors
-    # in this order: current working directory, metacc package parent (repo
-    # root), metacc package dir. This covers both running from repo root and
-    # running the packaged binary from inside the metacc package directory.
     if raw.is_absolute():
         raw_root = raw.resolve()
     else:
@@ -149,7 +113,6 @@ def resolve_project_root_arg(project_root_arg: str, cwd: pathlib.Path | None = N
             if candidate.exists():
                 resolved = candidate
                 if anchor is not anchors[0]:
-                    # Inform user which anchor was used for resolution
                     name = "metacc dir" if anchor == METACC_DIR else "metacc package parent"
                     warnings.append(f"[metacc] warning: --project-root '{project_root_arg}' resolved relative to {name}: {candidate}")
                 break
@@ -160,12 +123,6 @@ def resolve_project_root_arg(project_root_arg: str, cwd: pathlib.Path | None = N
         warnings.append(f"[metacc] warning: --project-root points to a file ({raw_root}); using parent dir: {parent}")
         return parent, raw_root, warnings
 
-    # Heuristic: when callers pass '.' (or a path that resolves to the metacc
-    # package dir) while running the packaged binary from inside the package,
-    # users usually mean the repo/project root. If the parent of METACC_DIR
-    # looks like a project root (contains CMakeLists.txt or compile_commands.json)
-    # prefer that as the project root so the same -p value behaves consistently
-    # between running the Python script and the packaged binary.
     if project_root_arg in (".", "./metacc") or raw_root == METACC_DIR:
         candidate_parent = METACC_DIR.parent
         if (candidate_parent / "CMakeLists.txt").exists() or (candidate_parent / "compile_commands.json").exists():
@@ -209,8 +166,8 @@ def ensure_metacc_header_path() -> pathlib.Path:
 
 
 # 核心受支持的 metacc 原生宏边界定义（不接受任何外部二次宏包装）
-METACC_MACROS = {"METACC_ENUM", "METACC_TABLE", "METACC_TABLE_ITEM", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH", "METACC_GUARD"}
-OWNER_MACROS = ("METACC_ENUM", "METACC_TABLE", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH", "METACC_GUARD")
+METACC_MACROS = {"METACC_ENUM", "METACC_TABLE", "METACC_TABLE_ITEM", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH"}
+OWNER_MACROS = ("METACC_ENUM", "METACC_TABLE", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH")
 METACC_TEXT_RE = re.compile(r'\b(?:' + "|".join(METACC_MACROS) + r')\b')
 PROJECT_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*["<]([^">]+)[">]', re.MULTILINE)
 
@@ -532,7 +489,7 @@ def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
         if cursor.kind != clang.CursorKind.MACRO_INSTANTIATION: continue
         
         kind = cursor.spelling
-        if kind not in METACC_MACROS: continue  # 拒绝任何非原生纯粹宏
+        if kind not in METACC_MACROS: continue
         
         resolved_args = macro_args(cursor)
         loc = cursor.location
@@ -563,7 +520,7 @@ def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
 
 def _process_file_worker(src_str: str, entry: dict, project_root_str: str, metacc_h_str: str, generated_root_str: str | None, active_libclang: str | None) -> dict:
     import clang.cindex as clang
-    if active_libclang:
+    if active_libclang and active_libclang != "SYSTEM_DEFAULT":
         try: clang.Config.set_library_file(active_libclang)
         except Exception: pass
     
@@ -692,7 +649,7 @@ def scan_project(project_root: pathlib.Path, compile_commands: list, cache_dir: 
         print(f"[metacc] Spawning {worker_count} process workers to parse {total_tasks} files...", flush=True)
         
         finished_count = 0
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count, initializer=_init_child_worker, initargs=(RESOLVED_LIBCLANG_PATH,)) as pool:
             futures = {
                 pool.submit(
                     _process_file_worker, src_str, item[0], str(project_root), str(metacc_h), str(generated_root) if generated_root else None, RESOLVED_LIBCLANG_PATH
@@ -702,7 +659,6 @@ def scan_project(project_root: pathlib.Path, compile_commands: list, cache_dir: 
                 src_str, cache_path = futures[fut]
                 finished_count += 1
                 short_name = pathlib.Path(src_str).name
-                # 【流式进度条补全】加上 flush=True 强制清空缓存打印
                 print(f"[metacc] [{finished_count}/{total_tasks}] Parsing {short_name}...", flush=True)
                 try:
                     res = fut.result()
@@ -1002,95 +958,6 @@ def run_hash(model: ProjectModel, buckets: dict):
         _append_companion_fragment(buckets, owner_path, h_lines, [])
 
 
-def run_guard(model: ProjectModel, generated_root: pathlib.Path | None):
-    if not generated_root: return
-    patched_dir = generated_root / "patched"
-    patched_dir.mkdir(parents=True, exist_ok=True)
-    
-    guards_by_file = {}
-    for ann in model.annotations_of_kind("METACC_GUARD"):
-        src = ann.get("file", ann["src"])
-        # Accept guards even when func_start/func_end are missing; we'll
-        # attempt to locate the enclosing function body heuristically.
-        guards_by_file.setdefault(src, []).append(ann)
-            
-    for src_str, anns in guards_by_file.items():
-        src_path = pathlib.Path(src_str)
-        content = read_text_maybe(src_path)
-        if not content: continue
-
-        lines = content.splitlines()
-        # Process annotations from bottom to top so line indices remain valid
-        for ann in sorted(anns, key=lambda x: x["line"], reverse=True):
-            if not ann.get("args"): continue
-            cleanup_expr = ann["args"][0].strip() + ";"
-            guard_line = ann.get("line")
-
-            # Determine function body bounds: prefer func_start/func_end if present
-            func_start = ann.get("func_start")
-            func_end = ann.get("func_end")
-
-            if not func_start or not func_end:
-                # Heuristic: find nearest opening brace '{' at or before guard_line,
-                # then match braces forward to find function end.
-                open_idx = None
-                search_idx = max(0, (guard_line - 1))
-                while search_idx >= 0:
-                    if '{' in lines[search_idx]:
-                        open_idx = search_idx
-                        break
-                    search_idx -= 1
-
-                if open_idx is None:
-                    # fallback: cannot determine bounds — skip this annotation
-                    continue
-
-                depth = 0
-                end_idx = None
-                for i in range(open_idx, len(lines)):
-                    depth += lines[i].count('{')
-                    depth -= lines[i].count('}')
-                    if depth == 0:
-                        end_idx = i
-                        break
-                if end_idx is None:
-                    continue
-
-                func_start = open_idx + 1  # convert to 1-based line index
-                func_end = end_idx + 1
-
-            # Extract the function body text and perform replacements in bulk to
-            # avoid context-sensitive parsing issues caused by single-line
-            # 'if (...) return ...;' patterns.
-            start_idx = func_start - 1
-            end_idx = func_end
-            func_text = "\n".join(lines[start_idx:end_idx])
-
-            # Replace inline 'if (...) return expr;' with braced form that
-            # runs cleanup only when condition holds.
-            pattern_if_return = re.compile(r'(\bif\b\s*\([^)]*\)\s*)return\s*([^;]+);')
-            func_text = pattern_if_return.sub(lambda m: f"{m.group(1)}{{ {cleanup_expr} return {m.group(2).strip()}; }}", func_text)
-
-            # For any remaining 'return' tokens (normal returns), insert cleanup
-            func_text = re.sub(r'\breturn\b', f"{cleanup_expr} return", func_text)
-
-            # Replace original lines with modified function text
-            new_lines = func_text.splitlines()
-            lines[start_idx:end_idx] = new_lines
-
-            # Ensure cleanup at function end (before the closing brace)
-            last_idx = func_end - 1
-            if last_idx < len(lines):
-                last_line = lines[last_idx]
-                if '}' in last_line and not re.search(r'\breturn\b', last_line):
-                    last_brace = last_line.rfind('}')
-                    lines[last_idx] = last_line[:last_brace] + f" {cleanup_expr} " + last_line[last_brace:]
-
-        patched_content = "\n".join(lines)
-        out_path = patched_dir / f"patched_{src_path.name}"
-        _write_if_changed(out_path, patched_content)
-
-
 def run_table(model: ProjectModel, buckets: dict, project_root: pathlib.Path, generated_root: pathlib.Path | None):
     tables = {}
     for ann in model.annotations_of_kind("METACC_TABLE"):
@@ -1195,7 +1062,7 @@ def run_struct(model: ProjectModel, buckets: dict):
         c_lines = [f"const MetaccFieldInfo metacc_fields_{struct_name}[] = {{"]
         for f in fields:
             type_kind = _c_type_to_metacc(f["type"])
-            c_lines.append(f"    {{\"{f['name']}\", 0, {f['offset']}, {f['size']}}},")
+            c_lines.append(f"    {{\"{f['name']}\", {type_kind}, {f['offset']}, {f['size']}}},")
         c_lines += ["};", f"const uint32_t metacc_field_count_{struct_name} = {len(fields)}u;"]
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
 
@@ -1215,7 +1082,6 @@ def run(project_root: pathlib.Path, compile_commands: list, cache_dir: pathlib.P
     run_hash(model, companion_fragments)
     
     _flush_companion_fragments(companion_fragments, project_root, generated_root)
-    run_guard(model, generated_root)
     
     print("[metacc] All code generation accomplished successfully.")
     return 0
@@ -1263,9 +1129,6 @@ def main():
         
         if not cc_path:
             print("[metacc] error: --compile-commands omitted and auto-discovery failed.", file=sys.stderr)
-            print("Searched locations:", file=sys.stderr)
-            for c in search_candidates:
-                print(f"  - {c}", file=sys.stderr)
             return 2
 
     if not cc_path.exists():
@@ -1274,7 +1137,7 @@ def main():
 
     compile_commands = json.loads(cc_path.read_text(encoding="utf-8"))
     
-    # 启动前置强校验，不给后续多进程留任何运行隐患
+    # 启动前置环境校验
     configure_and_verify_libclang(explicit_path=args.libclang)
     
     cache_dir = resolve_output_path(args.cache_dir, project_root) if args.cache_dir else default_cache_dir_for(project_root)

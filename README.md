@@ -102,6 +102,42 @@ add_custom_command(
 target_sources(${PROJECT_NAME} PRIVATE ${GENERATED_C_OUT} src/main.c)
 ```
 
+## 在上游工程（如 PlatNexus）中的集成与注意事项
+
+当 `metacc` 被作为第三方工具目录放入更大工程（例如 `PlatNexus/tools/metacc`）时，默认的安装说明可能会造成混淆 —— 生成步骤依赖于一个位于工具目录下的 Python 虚拟环境（CMake 刚性约定使用 `tools/metacc/venv/bin/python`）。请按以下步骤在宿主工程中准备环境：
+
+1. 在宿主工程根目录下创建并激活工具专用虚拟环境（确保路径为 `tools/metacc/venv`）：
+
+```bash
+cd /path/to/your/PlatNexus/tools/metacc
+sudo apt update
+sudo apt install libclang-18-dev    # 系统级 libclang 运行库
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+```
+
+2. 在该虚拟环境中安装 `metacc` 包与 Python 绑定依赖：
+
+```bash
+pip install -e .
+# 若在运行时遇到 "ModuleNotFoundError: No module named 'libclang'"，请单独安装 Python 绑定：
+pip install "libclang>=18.0.0"
+```
+
+3. 验证：
+
+```bash
+${PWD}/venv/bin/python -c "import libclang; print('libclang', libclang.__version__)") || true
+```
+
+常见故障与排查
+- 错误：`ModuleNotFoundError: No module named 'libclang'` — 说明运行的 Python 解释器（通常是 `tools/metacc/venv/bin/python`）未安装 `libclang` Python 包，进入 `tools/metacc` 的虚拟环境并执行 `pip install libclang` 即可。
+- 注意：系统包 `libclang-18-dev` 提供的是 C 层的共享库，Python 侧仍需通过 `pip` 安装 `libclang` 绑定。
+
+在完成以上准备后，回到宿主工程根目录并重新运行 CMake / Ninja 构建流程（CMake 的自定义命令会调用 `tools/metacc/venv/bin/python` 执行 `metacc.py`）。
+
+
 ---
 
 📝 **应用层业务直调示范 (Code Examples)**

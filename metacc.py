@@ -21,7 +21,14 @@ import subprocess
 import sys
 
 # 强依赖 pyproject.toml 保证环境，直接导入官方包
-from libclang import cindex as clang
+try:
+    from libclang import cindex as clang
+except ModuleNotFoundError:
+    try:
+        # 部分系统下 pip 包名为 `libclang`，但模块导入名为 `clang`
+        from clang import cindex as clang
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("No module named 'libclang' or 'clang'.\nPlease install the Python libclang bindings in the metacc virtualenv: `pip install libclang>=18.0.0`") from exc
 
 CACHE_VERSION   = 8
 TEMPLATE_AUTHOR = "houyuwenE@outlook.com"

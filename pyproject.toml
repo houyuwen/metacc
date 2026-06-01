@@ -5,34 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "metacc"
 version = "1.0.0"
-description = "A C language metaprogramming tool based on libclang."
+description = "C metaprogramming tool backed by libclang for high-performance Embedded SDK development."
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
 authors = [
-    {name = "houyuwen", email = "houyuwenE@outlook.com"}
+    { name = "houyuwen", email = "houyuwenE@outlook.com" }
 ]
-keywords = ["embedded", "metaprogramming", "libclang", "code-generation", "rtos"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C",
     "Topic :: Software Development :: Code Generators",
-    "Topic :: Software Development :: Embedded Systems"
 ]
 
 dependencies = [
-    "clang>=14.0",
+    "libclang>=18.0.0", 
 ]
 
 [project.scripts]
 metacc = "metacc:main"
-
-[tool.setuptools]
-py-modules = ["metacc"]

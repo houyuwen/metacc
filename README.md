@@ -66,6 +66,10 @@ metacc/
 在 metacc 仓库根目录下直接执行：
 
 ```bash
+sudo apt update
+sudo apt install libclang-18-dev
+python3 -m venv venv
+source venv/bin/activate
 pip install -e .
 ```
 

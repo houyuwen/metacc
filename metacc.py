@@ -4,6 +4,7 @@
 """metacc.py.
 
 C metaprogramming tool backed by libclang for high-performance Embedded SDK development.
+Clean version: Environment state is managed via pyproject.toml / standard libclang package.
 
 Copyright (c) 2026 houyuwen.
 """
@@ -19,65 +20,13 @@ import shlex
 import subprocess
 import sys
 
-try:
-    import clang.cindex as clang
-    _CLANG_AVAILABLE = True
-except ImportError:
-    _CLANG_AVAILABLE = False
+# 强依赖 pyproject.toml 保证环境，直接导入官方包
+from libclang import cindex as clang
 
-CACHE_VERSION   = 7
+CACHE_VERSION   = 8
 TEMPLATE_AUTHOR = "houyuwenE@outlook.com"
 TEMPLATE_YEAR   = str(datetime.date.today().year)
 TEMPLATE_DATE   = datetime.date.today().isoformat()
-
-# 全局变量，记录主进程中成功加载的 libclang 真实路径，用于传递给子进程
-RESOLVED_LIBCLANG_PATH = None
-
-
-def configure_and_verify_libclang(explicit_path: str | None = None) -> None:
-    """配置并校验 libclang 环境。依赖环境由 pyproject.toml 保证，不再执行冗余的本地文件深度搜寻。"""
-    global RESOLVED_LIBCLANG_PATH
-    if not _CLANG_AVAILABLE:
-        print("[metacc] CRITICAL ERROR: Python 'clang' package is not installed.", file=sys.stderr)
-        sys.exit(1)
-
-    # 优先尊重显式参数或用户环境变量
-    path = explicit_path or os.getenv("METACC_LIBCLANG")
-    if path:
-        resolved_file = pathlib.Path(path).resolve()
-        if resolved_file.is_file():
-            try:
-                if not clang.Config.loaded:
-                    clang.Config.set_library_file(str(resolved_file))
-                clang.Index.create()
-                RESOLVED_LIBCLANG_PATH = str(resolved_file)
-                return
-            except Exception as e:
-                print(f"[metacc] error: Failed to load explicit libclang at {resolved_file}: {e}", file=sys.stderr)
-                sys.exit(1)
-
-    # 默认信任 pyproject.toml 与系统底层标准的环境变量/动态库加载链
-    try:
-        if not clang.Config.loaded:
-            clang.Index.create()
-        RESOLVED_LIBCLANG_PATH = "SYSTEM_DEFAULT"
-    except Exception as e:
-        print("=" * 80, file=sys.stderr)
-        print(f"[metacc] CRITICAL ERROR: libclang runtime initialization failed: {e}", file=sys.stderr)
-        print("请检查系统是否正确安装了 LLVM/Clang 二进制运行库。", file=sys.stderr)
-        print("=" * 80, file=sys.stderr)
-        sys.exit(1)
-
-
-def _init_child_worker(libclang_path: str | None) -> None:
-    """多进程并行的子进程初始化钩子，确保子进程能无缝继承主进程的 libclang 路径。"""
-    if libclang_path and libclang_path != "SYSTEM_DEFAULT":
-        try:
-            if not clang.Config.loaded:
-                clang.Config.set_library_file(libclang_path)
-        except Exception:
-            pass
-
 
 def _metacc_dir() -> pathlib.Path:
     script_path = pathlib.Path(__file__).resolve()
@@ -86,17 +35,8 @@ def _metacc_dir() -> pathlib.Path:
         return metacc_dir.parent
     return metacc_dir
 
-
 METACC_DIR = _metacc_dir()
 METACC_H_NAME = "metacc.h"
-METACC_ERROR_COUNT = 0
-
-
-def metacc_error(message: str) -> None:
-    global METACC_ERROR_COUNT
-    METACC_ERROR_COUNT += 1
-    print(message, file=sys.stderr)
-
 
 def resolve_project_root_arg(project_root_arg: str, cwd: pathlib.Path | None = None) -> tuple[pathlib.Path, pathlib.Path, list[str]]:
     raw = pathlib.Path(project_root_arg)
@@ -131,7 +71,6 @@ def resolve_project_root_arg(project_root_arg: str, cwd: pathlib.Path | None = N
 
     return raw_root, raw_root, warnings
 
-
 def resolve_existing_input_path(path_arg: str, anchors: list[pathlib.Path]) -> pathlib.Path:
     path = pathlib.Path(path_arg)
     if path.is_absolute():
@@ -142,21 +81,17 @@ def resolve_existing_input_path(path_arg: str, anchors: list[pathlib.Path]) -> p
             return candidate
     return path.resolve()
 
-
 def resolve_output_path(path_arg: str, project_root: pathlib.Path) -> pathlib.Path:
     path = pathlib.Path(path_arg)
     if path.is_absolute():
         return path.resolve()
     return (project_root / path).resolve()
 
-
 def default_cache_dir_for(project_root: pathlib.Path) -> pathlib.Path:
     return (project_root / "build" / ".metacc" / ".cache").resolve()
 
-
 def default_generated_root_for(project_root: pathlib.Path) -> pathlib.Path:
     return (project_root / "build" / "metacc_files").resolve()
-
 
 def ensure_metacc_header_path() -> pathlib.Path:
     candidate = (METACC_DIR / METACC_H_NAME).resolve()
@@ -164,29 +99,41 @@ def ensure_metacc_header_path() -> pathlib.Path:
         raise FileNotFoundError(f"[metacc] error: Core release header missing at: {candidate}. Please check deployment.")
     return candidate
 
-
-# 核心受支持的 metacc 原生宏边界定义（不接受任何外部二次宏包装）
 METACC_MACROS = {"METACC_ENUM", "METACC_TABLE", "METACC_TABLE_ITEM", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH"}
-OWNER_MACROS = ("METACC_ENUM", "METACC_TABLE", "METACC_STRUCT", "METACC_SERIALIZE", "METACC_SHELL", "METACC_INTERFACE", "METACC_HASH")
 METACC_TEXT_RE = re.compile(r'\b(?:' + "|".join(METACC_MACROS) + r')\b')
 PROJECT_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*["<]([^">]+)[">]', re.MULTILINE)
-
 
 def split_top_level_commas(s: str) -> list:
     out, cur = [], []
     depth_p = depth_b = depth_c = 0
-    quote = escape = False
+    in_quote = False
+    quote_char = None
+    escape = False
+
     for ch in s:
-        if quote:
+        if escape:
             cur.append(ch)
-            if escape:       escape = False
-            elif ch == '\\': escape = True
-            elif ch == '"':  quote = False
+            escape = False
             continue
-        if ch == '"':
-            quote = True; cur.append(ch); continue
+        if ch == '\\':
+            cur.append(ch)
+            escape = True
+            continue
+        if in_quote:
+            cur.append(ch)
+            if ch == quote_char:
+                in_quote = False
+                quote_char = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = True
+            quote_char = ch
+            cur.append(ch)
+            continue
         if ch == ',' and not depth_p and not depth_b and not depth_c:
-            out.append(''.join(cur)); cur = []; continue
+            out.append(''.join(cur).strip())
+            cur = []
+            continue
         if ch == '(':   depth_p += 1
         elif ch == ')' and depth_p: depth_p -= 1
         elif ch == '[': depth_b += 1
@@ -194,9 +141,10 @@ def split_top_level_commas(s: str) -> list:
         elif ch == '{': depth_c += 1
         elif ch == '}' and depth_c: depth_c -= 1
         cur.append(ch)
-    if cur: out.append(''.join(cur))
-    return out
-
+        
+    if cur:
+        out.append(''.join(cur).strip())
+    return [part for part in out if part]
 
 def parse_kv_args(args: list) -> dict:
     result = {}
@@ -209,19 +157,24 @@ def parse_kv_args(args: list) -> dict:
             result[arg] = True
     return result
 
-
 def macro_args(cursor) -> list:
     tokens = list(cursor.get_tokens())
     collecting = False
     depth = 0
     raw_parts = []
+    prev_end_col = None
+
     for tok in tokens:
         sp = tok.spelling
+        loc = tok.extent.start
+        
         if not collecting:
             if sp == '(':
                 collecting = True
                 depth = 1
+                prev_end_col = tok.extent.end.column
             continue
+            
         if sp == '(':
             depth += 1
             raw_parts.append(sp)
@@ -231,10 +184,14 @@ def macro_args(cursor) -> list:
                 break
             raw_parts.append(sp)
         else:
+            if prev_end_col is not None and loc.column > prev_end_col:
+                raw_parts.append(" ")
             raw_parts.append(sp)
-    raw = ''.join(raw_parts)
-    return [a.strip() for a in split_top_level_commas(raw) if a.strip()]
+            
+        prev_end_col = tok.extent.end.column
 
+    raw = ''.join(raw_parts)
+    return split_top_level_commas(raw)
 
 def normalize_function_token(token: str) -> str | None:
     t = token.strip()
@@ -246,7 +203,6 @@ def normalize_function_token(token: str) -> str | None:
         t = t[1:-1].strip()
     return t or None
 
-
 def read_text_maybe(path: pathlib.Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -254,7 +210,6 @@ def read_text_maybe(path: pathlib.Path) -> str | None:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return None
-
 
 def resolve_project_include_path(include_name: str, including_file: pathlib.Path, project_root: pathlib.Path) -> pathlib.Path | None:
     candidates = [
@@ -266,36 +221,27 @@ def resolve_project_include_path(include_name: str, including_file: pathlib.Path
             return candidate
     return None
 
-
 def source_tree_might_contain_metacc_text(src_path: pathlib.Path, project_root: pathlib.Path) -> tuple[bool, list[pathlib.Path]]:
     project_root = project_root.resolve()
     root_src = src_path.resolve()
-    to_visit = [root_src]
-    visited = set()
-    deps = []
-
-    while to_visit:
-        path = to_visit.pop()
-        if path in visited or not path.exists():
-            continue
-        if path != root_src:
-            try:
-                path.relative_to(project_root)
-            except ValueError:
-                continue
-        visited.add(path)
-        deps.append(path)
-        text = read_text_maybe(path)
-        if text is None:
-            continue
-        if "METACC_" in text and METACC_TEXT_RE.search(text):
-            return True, deps
-        for include_name in PROJECT_INCLUDE_RE.findall(text):
-            include_path = resolve_project_include_path(include_name, path, project_root)
-            if include_path is not None and include_path not in visited:
-                to_visit.append(include_path)
+    
+    text = read_text_maybe(root_src)
+    if text is None:
+        return False, []
+        
+    if "METACC_" in text and METACC_TEXT_RE.search(text):
+        return True, [root_src]
+        
+    deps = [root_src]
+    for include_name in PROJECT_INCLUDE_RE.findall(text):
+        include_path = resolve_project_include_path(include_name, root_src, project_root)
+        if include_path and include_path.exists():
+            deps.append(include_path)
+            inc_text = read_text_maybe(include_path)
+            if inc_text and "METACC_" in inc_text and METACC_TEXT_RE.search(inc_text):
+                return True, deps
+                
     return False, deps
-
 
 def collect_enums(tu) -> dict:
     enums = {}
@@ -312,7 +258,6 @@ def collect_enums(tu) -> dict:
             vals = _extract_enum_cursor(cursor)
             if vals: enums[cursor.spelling] = vals
     return enums
-
 
 def collect_structs(tu) -> dict:
     structs = {}
@@ -339,7 +284,6 @@ def collect_structs(tu) -> dict:
             fields = _extract_fields(cursor)
             if fields: structs[cursor.spelling] = fields
     return structs
-
 
 def collect_nonstatic_functions(tu) -> dict:
     main_file = tu.spelling
@@ -372,7 +316,6 @@ def collect_nonstatic_functions(tu) -> dict:
         }
     return protos
 
-
 def collect_function_protos(model, tokens: list[str]) -> list:
     protos = []
     for token in tokens:
@@ -383,7 +326,6 @@ def collect_function_protos(model, tokens: list[str]) -> list:
             if decl not in protos:
                 protos.append(decl)
     return protos
-
 
 _COMPILER_SYSTEM_INCLUDES = {}
 
@@ -410,7 +352,6 @@ def compiler_system_include_dirs(compiler: str) -> list:
     _COMPILER_SYSTEM_INCLUDES[compiler] = includes
     return includes
 
-
 def infer_clang_target(compiler: str, raw_args: list[str]) -> str | None:
     for arg in raw_args:
         if arg.startswith("-march="):
@@ -422,13 +363,11 @@ def infer_clang_target(compiler: str, raw_args: list[str]) -> str | None:
     if "arm-none-eabi" in compiler_name: return "arm-none-eabi"
     return None
 
-
 def sanitize_riscv_march(march: str) -> str:
     parts = march.split("_")
     if len(parts) <= 1: return march
     kept = [parts[0]] + [part for part in parts[1:] if not part.startswith("xx")]
     return "_".join(kept)
-
 
 _KEEP_ARG_PREFIXES = ("-D", "-U", "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-std=", "-x", "--target=", "-mabi=", "-fpack-struct")
 _KEEP_ARG_EXACT = {"-nostdinc", "-nostdinc++", "-fshort-enums", "-fshort-wchar", "-funsigned-char", "-fsigned-char", "-fno-common"}
@@ -471,7 +410,6 @@ def clang_args_from_entry(entry: dict, metacc_h: pathlib.Path) -> list:
     
     keep += ["-D__attribute__(x)=", "-D__flash=", "-D__interrupt=", "-D__asm__(x)=", "-include", str(metacc_h)]
     return keep
-
 
 def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
     annotations = []
@@ -517,13 +455,7 @@ def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
         })
     return annotations
 
-
-def _process_file_worker(src_str: str, entry: dict, project_root_str: str, metacc_h_str: str, generated_root_str: str | None, active_libclang: str | None) -> dict:
-    import clang.cindex as clang
-    if active_libclang and active_libclang != "SYSTEM_DEFAULT":
-        try: clang.Config.set_library_file(active_libclang)
-        except Exception: pass
-    
+def _process_file_worker(src_str: str, entry: dict, project_root_str: str, metacc_h_str: str, generated_root_str: str | None) -> dict:
     project_root = pathlib.Path(project_root_str)
     metacc_h = pathlib.Path(metacc_h_str)
     src = pathlib.Path(src_str)
@@ -542,12 +474,21 @@ def _process_file_worker(src_str: str, entry: dict, project_root_str: str, metac
     args = clang_args_from_entry(entry, metacc_h)
     
     try:
-        tu = index.parse(src_str, args=args, options=clang.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD | clang.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES)
-    except Exception:
+        tu = index.parse(src_str, args=args, options=clang.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+    except Exception as e:
+        print(f"[metacc] Crash parsing {src_str}: {e}", file=sys.stderr)
         return {"src": src_str, "annotations": [], "enums": {}, "structs": {}, "protos": {}, "deps": [], "matched": False}
 
     if not tu:
         return {"src": src_str, "annotations": [], "enums": {}, "structs": {}, "protos": {}, "deps": [], "matched": False}
+
+    has_fatal_errors = False
+    for diag in tu.diagnostics:
+        if diag.severity >= clang.Diagnostic.Error:
+            has_fatal_errors = True
+            print(f"[metacc] Clang Parser Error in [{src_str}:{diag.location.line}:{diag.location.column}]: {diag.spelling}", file=sys.stderr)
+    if has_fatal_errors:
+        print(f"[metacc] warning: AST generation for {src.name} might be heavily truncated due to compilation issues.", file=sys.stderr)
 
     deps = []
     for inc in tu.get_includes():
@@ -571,7 +512,6 @@ def _process_file_worker(src_str: str, entry: dict, project_root_str: str, metac
         "deps": deps,
         "matched": True
     }
-
 
 class ProjectModel:
     def __init__(self, root: pathlib.Path, file_results: list):
@@ -597,7 +537,6 @@ class ProjectModel:
         for vals in self.enums.values():
             if t in vals: return (0, vals[t])
         return (1, t)
-
 
 def scan_project(project_root: pathlib.Path, compile_commands: list, cache_dir: pathlib.Path, jobs: int, generated_root: pathlib.Path | None) -> ProjectModel:
     metacc_h = ensure_metacc_header_path()
@@ -649,10 +588,10 @@ def scan_project(project_root: pathlib.Path, compile_commands: list, cache_dir: 
         print(f"[metacc] Spawning {worker_count} process workers to parse {total_tasks} files...", flush=True)
         
         finished_count = 0
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count, initializer=_init_child_worker, initargs=(RESOLVED_LIBCLANG_PATH,)) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(
-                    _process_file_worker, src_str, item[0], str(project_root), str(metacc_h), str(generated_root) if generated_root else None, RESOLVED_LIBCLANG_PATH
+                    _process_file_worker, src_str, item[0], str(project_root), str(metacc_h), str(generated_root) if generated_root else None
                 ): (src_str, item[1]) for src_str, item in tasks_to_run.items()
             }
             for fut in concurrent.futures.as_completed(futures):
@@ -671,7 +610,6 @@ def scan_project(project_root: pathlib.Path, compile_commands: list, cache_dir: 
                     print(f"[metacc] process error {src_str}: {e}", file=sys.stderr, flush=True)
 
     return ProjectModel(project_root, results)
-
 
 _CLANG_TYPE_MAP = {
     "bool": "METACC_TYPE_BOOL", "_Bool": "METACC_TYPE_BOOL",
@@ -692,18 +630,18 @@ _CLANG_TYPE_MAP = {
 def _c_type_to_metacc(type_str: str) -> str:
     t = type_str.strip()
     if t in _CLANG_TYPE_MAP: return _CLANG_TYPE_MAP[t]
+    if t.startswith("char *") or t.startswith("const char *") or t.endswith("char*"):
+        return "METACC_TYPE_STRING"
     if t.endswith("*") or "const *" in t or "* const" in t: return "METACC_TYPE_POINTER"
     if "[" in t:
         if "char" in t: return "METACC_TYPE_STRING"
         return "METACC_TYPE_ARRAY"
     return "METACC_TYPE_STRUCT"
 
-
 def _write_if_changed(path: pathlib.Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text(encoding="utf-8") == text: return
     path.write_text(text, encoding="utf-8")
-
 
 def companion_paths(owner_path: pathlib.Path, project_root: pathlib.Path, generated_root: pathlib.Path | None) -> tuple[pathlib.Path, pathlib.Path]:
     owner_abs = owner_path.resolve()
@@ -713,20 +651,16 @@ def companion_paths(owner_path: pathlib.Path, project_root: pathlib.Path, genera
     out_c_dir = generated_root / "src"
     return out_h_dir / f"metacc_{owner_abs.stem}.h", out_c_dir / f"metacc_{owner_abs.stem}.c"
 
-
 def _render_generated_header(filename: str, body: str) -> str:
     return f"/**\n * @file {filename}\n * @brief Automatically generated by metacc. Do not edit.\n */\n#pragma once\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\n#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n\n{body.strip()}\n\n#ifdef __cplusplus\n}}\n#endif\n"
 
-
 def _render_generated_source(filename: str, owner_include: str, gen_header_include: str, body: str) -> str:
     return f"/**\n * @file {filename}\n * @brief Automatically generated by metacc. Do not edit.\n */\n#include \"{owner_include}\"\n#include \"{gen_header_include}\"\n#include <string.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n{body.strip()}\n"
-
 
 def _append_companion_fragment(buckets: dict, owner_path: pathlib.Path, header_lines: list, source_lines: list):
     bucket = buckets.setdefault(str(owner_path), {"owner_path": owner_path, "header_parts": [], "source_parts": []})
     if header_lines: bucket["header_parts"].append("\n".join(header_lines).rstrip())
     if source_lines: bucket["source_parts"].append("\n".join(source_lines).rstrip())
-
 
 def _flush_companion_fragments(buckets: dict, project_root: pathlib.Path, generated_root: pathlib.Path | None):
     for bucket in buckets.values():
@@ -740,7 +674,6 @@ def _flush_companion_fragments(buckets: dict, project_root: pathlib.Path, genera
         
         _write_if_changed(h_path, h_text)
         _write_if_changed(c_path, c_text)
-
 
 def parse_func_ptr(type_str: str, field_name: str, interface_name: str) -> dict | None:
     if "(*)" not in type_str:
@@ -764,7 +697,6 @@ def parse_func_ptr(type_str: str, field_name: str, interface_name: str) -> dict 
         "name": field_name,
         "args": args_parsed
     }
-
 
 def run_serialize(model: ProjectModel, buckets: dict):
     for ann in model.annotations_of_kind("METACC_SERIALIZE"):
@@ -803,7 +735,6 @@ def run_serialize(model: ProjectModel, buckets: dict):
             "}"
         ]
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
-
 
 def run_shell(model: ProjectModel, buckets: dict):
     from collections import defaultdict
@@ -845,8 +776,7 @@ def run_shell(model: ProjectModel, buckets: dict):
             func_name = cmd["func"]
             
             c_lines += [
-                f"void metacc_shell_wrapper_{cmd_name}(int argc, char** argv) {{",
-                "    (void)argc; (void)argv;"
+                f"void metacc_shell_wrapper_{cmd_name}(int argc, char** argv) {{"
             ]
             
             args_meta = []
@@ -878,7 +808,6 @@ def run_shell(model: ProjectModel, buckets: dict):
         c_lines.append(f"const uint32_t metacc_shell_cmd_count_{owner_path.stem} = {len(cmds)}u;")
         
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
-
 
 def run_interface(model: ProjectModel, buckets: dict):
     for ann in model.annotations_of_kind("METACC_INTERFACE"):
@@ -941,7 +870,6 @@ def run_interface(model: ProjectModel, buckets: dict):
         
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
 
-
 def run_hash(model: ProjectModel, buckets: dict):
     for ann in model.annotations_of_kind("METACC_HASH"):
         args = ann["args"]
@@ -956,7 +884,6 @@ def run_hash(model: ProjectModel, buckets: dict):
         owner_path = pathlib.Path(ann.get("file", ann["src"]))
         h_lines = [f"#define {hash_macro_name} (0x{hval:08X}u) /* Hashed from \"{raw_string}\" */"]
         _append_companion_fragment(buckets, owner_path, h_lines, [])
-
 
 def run_table(model: ProjectModel, buckets: dict, project_root: pathlib.Path, generated_root: pathlib.Path | None):
     tables = {}
@@ -1019,7 +946,6 @@ def run_table(model: ProjectModel, buckets: dict, project_root: pathlib.Path, ge
         
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
 
-
 def run_enum(model: ProjectModel, buckets: dict):
     for ann in model.annotations_of_kind("METACC_ENUM"):
         if not ann["args"]: continue
@@ -1044,7 +970,6 @@ def run_enum(model: ProjectModel, buckets: dict):
         c_lines += ["    return false;", "}"]
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
 
-
 def run_struct(model: ProjectModel, buckets: dict):
     for ann in model.annotations_of_kind("METACC_STRUCT"):
         if not ann["args"]: continue
@@ -1066,7 +991,6 @@ def run_struct(model: ProjectModel, buckets: dict):
         c_lines += ["};", f"const uint32_t metacc_field_count_{struct_name} = {len(fields)}u;"]
         _append_companion_fragment(buckets, owner_path, h_lines, c_lines)
 
-
 def run(project_root: pathlib.Path, compile_commands: list, cache_dir: pathlib.Path, jobs: int, generated_root: pathlib.Path | None):
     print("[metacc] Scanning project tree and parsing AST via libclang process workers...")
     model = scan_project(project_root, compile_commands, cache_dir, jobs, generated_root)
@@ -1086,7 +1010,6 @@ def run(project_root: pathlib.Path, compile_commands: list, cache_dir: pathlib.P
     print("[metacc] All code generation accomplished successfully.")
     return 0
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="C metaprogramming tool built for Embedded SDK via libclang",
@@ -1102,8 +1025,6 @@ def main():
                         help="Process pool worker count")
     parser.add_argument("-g", "--generated-root", default=None, 
                         help="Target root dir for output files (default: project_root/build/metacc_files)")
-    parser.add_argument("--libclang", default=None,
-                        help="Explicit path to libclang.so / libclang.dylib / libclang.dll")
     args = parser.parse_args()
 
     project_root, raw_root, warnings = resolve_project_root_arg(args.project_root)
@@ -1137,9 +1058,6 @@ def main():
 
     compile_commands = json.loads(cc_path.read_text(encoding="utf-8"))
     
-    # 启动前置环境校验
-    configure_and_verify_libclang(explicit_path=args.libclang)
-    
     cache_dir = resolve_output_path(args.cache_dir, project_root) if args.cache_dir else default_cache_dir_for(project_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
     
@@ -1147,7 +1065,6 @@ def main():
     generated_root.mkdir(parents=True, exist_ok=True)
 
     return run(project_root, compile_commands, cache_dir, args.jobs, generated_root)
-
 
 if __name__ == "__main__":
     sys.exit(main())

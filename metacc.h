@@ -43,14 +43,8 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* Exported constants --------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/
-#define METACC_ENUM(name, ...)        /* metacc:enum        */
-#define METACC_STRUCT(name, ...)      /* metacc:struct      */
-#define METACC_SERIALIZE(name, ...)   /* metacc:serialize   */
-#define METACC_TABLE(name, type, ...) /* metacc:table       */
-#define METACC_TABLE_ITEM(name, ...)  /* metacc:table_item  */
-#define METACC_SHELL(name, ...)       /* metacc:shell       */
-#define METACC_INTERFACE(name, ...)   /* metacc:interface   */
-#define METACC_HASH(name, ...)        /* metacc:hash        */
+#define METACC_TABLE(name, type, ...)      /* metacc:table       */
+#define METACC_TABLE_ITEM(name, ...)       /* metacc:table_item  */
 
 /* Exported functions --------------------------------------------------------*/
 #ifdef __cplusplus

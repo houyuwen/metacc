@@ -13,6 +13,7 @@ discovered reliably.
 Copyright (c) 2026 houyuwen.
 """
 import argparse
+from collections import deque
 import concurrent.futures
 import hashlib
 import json
@@ -28,47 +29,50 @@ from datetime import datetime
 # libclang bindings (official pip package or system clang)
 # ---------------------------------------------------------------------------
 try:
-    from libclang import cindex as clang
-except ModuleNotFoundError:
-    try:
-        from clang import cindex as clang
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "No module named 'libclang' or 'clang'.\n"
-            "Please install the Python libclang bindings in the metacc virtualenv:\n"
-            "    pip install libclang>=18.0.0"
-        ) from exc
+    from clang import cindex as clang
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "No module named 'clang'.\n"
+        "Please install the Python libclang bindings in the metacc virtualenv:\n"
+        "    pip install libclang>=18.0.0"
+    ) from exc
 
 # ---------------------------------------------------------------------------
 # Explicitly set libclang native library path for Nuitka-packaged and
-# source-parity scenarios.  Prefer the bundled copy in the script directory
-# (or release/ when running the standalone binary) so that the exact same
-# libclang version is used regardless of how metacc is invoked.
+# source-parity scenarios.  Prefer the bundled copy in the executable/script
+# directory so the standalone release stays a single flat folder.
 # ---------------------------------------------------------------------------
 def _configure_libclang_path() -> None:
     """Point clang.cindex at the libclang.so shipped alongside this script."""
     import ctypes.util
 
     _here = pathlib.Path(__file__).resolve().parent
+    _libname = (
+        "libclang.dll"
+        if sys.platform.startswith("win")
+        else ("libclang.dylib" if sys.platform == "darwin" else "libclang.so")
+    )
+
+    _env_lib = os.getenv("METACC_LIBCLANG")
+    if _env_lib:
+        _env_path = pathlib.Path(_env_lib).expanduser().resolve()
+        if _env_path.is_file():
+            clang.Config.set_library_file(str(_env_path))
+            return
+
     _candidates: list[pathlib.Path] = [
         _here,
-        _here / "release" / "metacc",  # Nuitka-packaged output
     ]
     _venv_native = _here / "venv" / "lib"
     if _venv_native.exists():
         for _p in _venv_native.glob("python3.*/site-packages/clang/native"):
             _candidates.append(_p)
 
-    _names = (
-        "libclang.so", "libclang-18.so.18", "libclang.so.18",
-        "libclang_native.so",
-    )
     for _d in _candidates:
-        for _n in _names:
-            _cand = (_d / _n).resolve()
-            if _cand.is_file():
-                clang.Config.set_library_file(str(_cand))
-                return
+        _cand = (_d / _libname).resolve()
+        if _cand.is_file():
+            clang.Config.set_library_file(str(_cand))
+            return
 
     # Fallback: let the system ctypes finder resolve it.
     _sys_lib = ctypes.util.find_library("clang")
@@ -82,13 +86,17 @@ del _configure_libclang_path
 # ---------------------------------------------------------------------------
 # constants
 # ---------------------------------------------------------------------------
-CACHE_VERSION = 9  # bumped: structs removed, transitive-include scanning added
+CACHE_VERSION = 15  # bumped: collect prototypes inside C++ linkage blocks
 
 METACC_MACROS = {"METACC_TABLE", "METACC_TABLE_ITEM"}
 METACC_TEXT_RE = re.compile(r"\b(?:METACC_TABLE|METACC_TABLE_ITEM)\b")
 PROJECT_INCLUDE_RE = re.compile(
     r'^\s*#\s*include\s*["<]([^">]+)[">]', re.MULTILINE
 )
+SOURCE_EXTENSIONS = (
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+)
+CXX_EXTENSIONS = (".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx")
 
 
 # ===========================================================================
@@ -204,20 +212,121 @@ def default_generated_root_for(project_root: pathlib.Path) -> pathlib.Path:
     return (project_root / "build" / "metacc_files").resolve()
 
 
+def is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def is_generated_path(
+    path: pathlib.Path,
+    generated_root: pathlib.Path | None,
+) -> bool:
+    return generated_root is not None and is_relative_to(path, generated_root)
+
+
+def is_project_source_path(
+    path: pathlib.Path,
+    project_root: pathlib.Path,
+    generated_root: pathlib.Path | None = None,
+) -> bool:
+    path = path.resolve()
+    if is_generated_path(path, generated_root):
+        return False
+    return is_relative_to(path, project_root)
+
+
 def resolve_project_include_path(
     include_name: str,
     including_file: pathlib.Path,
     project_root: pathlib.Path,
+    include_dirs: list[pathlib.Path] | None = None,
 ) -> pathlib.Path | None:
-    """Resolve a #include path relative to the including file or project root."""
-    candidates = [
-        (including_file.parent / include_name).resolve(),
-        (project_root / include_name).resolve(),
-    ]
+    """Resolve a #include path using project-style include search order."""
+    include_path = pathlib.Path(include_name)
+    if include_path.is_absolute():
+        candidate = include_path.resolve()
+        return candidate if candidate.exists() else None
+
+    candidates = []
+    for base in [including_file.parent, *(include_dirs or []), project_root]:
+        candidate = (base / include_name).resolve()
+        if candidate not in candidates:
+            candidates.append(candidate)
     for c in candidates:
         if c.exists():
             return c
     return None
+
+
+def compile_entry_raw_args(entry: dict) -> list[str]:
+    if entry.get("command"):
+        try:
+            return shlex.split(entry["command"])
+        except ValueError as exc:
+            src = entry.get("file", "<unknown>")
+            raise ValueError(
+                f"invalid compile command for {src}: {exc}"
+            ) from exc
+    return list(entry.get("arguments", []))
+
+
+def compile_entry_directory(
+    entry: dict,
+    project_root: pathlib.Path,
+) -> pathlib.Path:
+    directory = entry.get("directory")
+    if directory:
+        return pathlib.Path(directory).resolve()
+    return project_root.resolve()
+
+
+def _path_arg(value: str, base_dir: pathlib.Path) -> str:
+    path = pathlib.Path(value)
+    if path.is_absolute():
+        return str(path.resolve())
+    return str((base_dir / path).resolve())
+
+
+_INCLUDE_DIR_PAIR_FLAGS = {
+    "-I", "-isystem", "-iquote", "-idirafter",
+}
+_INCLUDE_FILE_PAIR_FLAGS = {
+    "-include", "-imacros",
+}
+_PATH_PAIR_FLAGS = _INCLUDE_DIR_PAIR_FLAGS | _INCLUDE_FILE_PAIR_FLAGS
+
+
+def include_search_dirs_from_entry(
+    entry: dict,
+    project_root: pathlib.Path,
+) -> list[pathlib.Path]:
+    raw = compile_entry_raw_args(entry)
+    base_dir = compile_entry_directory(entry, project_root)
+    dirs: list[pathlib.Path] = []
+
+    def add_dir(value: str) -> None:
+        path = pathlib.Path(_path_arg(value, base_dir))
+        if path.is_dir() and path not in dirs:
+            dirs.append(path)
+
+    i = 1
+    while i < len(raw):
+        arg = raw[i]
+        if arg in _INCLUDE_DIR_PAIR_FLAGS:
+            if i + 1 < len(raw):
+                add_dir(raw[i + 1])
+            i += 2
+            continue
+        for flag in _INCLUDE_DIR_PAIR_FLAGS:
+            if arg.startswith(flag) and len(arg) > len(flag):
+                add_dir(arg[len(flag):])
+                break
+        i += 1
+
+    return dirs
 
 
 # ===========================================================================
@@ -231,6 +340,30 @@ def read_text_maybe(path: pathlib.Path) -> str | None:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return None
+
+
+def path_dependency(path: pathlib.Path) -> dict | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return {
+        "path": str(path),
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+    }
+
+
+def dependencies_for_paths(paths) -> list[dict]:
+    deps = []
+    seen: set[str] = set()
+    for path in paths:
+        dep = path_dependency(pathlib.Path(path))
+        if not dep or dep["path"] in seen:
+            continue
+        seen.add(dep["path"])
+        deps.append(dep)
+    return deps
 
 
 # ===========================================================================
@@ -364,18 +497,28 @@ def normalize_function_token(token: str) -> str | None:
 # ===========================================================================
 
 def source_tree_might_contain_metacc_text(
-    src_path: pathlib.Path, project_root: pathlib.Path
+    src_path: pathlib.Path,
+    project_root: pathlib.Path,
+    include_dirs: list[pathlib.Path] | None = None,
 ) -> tuple[bool, list[pathlib.Path]]:
     """Return (True, deps) if *src_path* or any transitively-included header
     contains a METACC_TABLE / METACC_TABLE_ITEM macro reference.
 
-    FIXED: now recursively follows transitive #include chains so that a table
-    declared in a nested header (a.c -> b.h -> c.h) is not silently skipped.
+    Follows transitive #include chains so that a table declared in a nested
+    header (a.c -> b.h -> c.h) is not silently skipped.
     """
     src_path = src_path.resolve()
     project_root = project_root.resolve()
+    include_dirs = include_dirs or []
+    text_cache: dict[pathlib.Path, str | None] = {}
 
-    text = read_text_maybe(src_path)
+    def get_text(path: pathlib.Path) -> str | None:
+        path = path.resolve()
+        if path not in text_cache:
+            text_cache[path] = read_text_maybe(path)
+        return text_cache[path]
+
+    text = get_text(src_path)
     if text is None:
         return False, []
 
@@ -384,21 +527,21 @@ def source_tree_might_contain_metacc_text(
 
     deps: list[pathlib.Path] = [src_path]
     visited: set[pathlib.Path] = {src_path}
-    queue: list[pathlib.Path] = [src_path]
+    queue: deque[pathlib.Path] = deque([src_path])
 
     while queue:
-        current = queue.pop(0)
-        current_text = read_text_maybe(current)
+        current = queue.popleft()
+        current_text = get_text(current)
         if current_text is None:
             continue
         for include_name in PROJECT_INCLUDE_RE.findall(current_text):
             ip = resolve_project_include_path(
-                include_name, current, project_root
+                include_name, current, project_root, include_dirs
             )
             if ip and ip.exists() and ip not in visited:
                 visited.add(ip)
                 deps.append(ip)
-                inc_text = read_text_maybe(ip)
+                inc_text = get_text(ip)
                 if (
                     inc_text
                     and "METACC_" in inc_text
@@ -444,13 +587,12 @@ def collect_enums(tu) -> dict:
 def collect_nonstatic_functions(tu) -> dict:
     """Collect prototypes of non-static functions defined in *tu*'s main file.
 
-    FIXED: use os.path.samefile to compare main-file identity robustly
-    (handles symlinks and path-format mismatches between tu.spelling and
-    loc.file.name).
+    Uses os.path.samefile to compare main-file identity robustly, which handles
+    symlinks and path-format mismatches between tu.spelling and loc.file.name.
     """
     main_file = tu.spelling
     protos: dict = {}
-    for cursor in tu.cursor.get_children():
+    for cursor in tu.cursor.walk_preorder():
         if cursor.kind != clang.CursorKind.FUNCTION_DECL:
             continue
         loc = cursor.location
@@ -467,12 +609,6 @@ def collect_nonstatic_functions(tu) -> dict:
             continue
 
         ret = cursor.result_type.spelling
-        args_list = []
-        for p in cursor.get_arguments():
-            args_list.append({
-                "type": p.type.spelling,
-                "name": p.spelling or f"arg{len(args_list)}",
-            })
         params = (
             ", ".join(
                 p.type.spelling + (" " + p.spelling if p.spelling else "")
@@ -480,61 +616,42 @@ def collect_nonstatic_functions(tu) -> dict:
             )
             or "void"
         )
-        protos[cursor.spelling] = {
-            "decl": f"{ret} {cursor.spelling}({params});",
-            "args": args_list,
-            "return_type": ret,
-        }
+        protos[cursor.spelling] = f"{ret} {cursor.spelling}({params});"
     return protos
 
 
 def collect_function_protos(model, tokens: list[str]) -> list:
     protos = []
+    seen: set[str] = set()
     for token in tokens:
         name = normalize_function_token(token)
         if name and name in model.protos:
             meta = model.protos[name]
             decl = meta["decl"] if isinstance(meta, dict) else meta
-            if decl not in protos:
+            if decl not in seen:
+                seen.add(decl)
                 protos.append(decl)
     return protos
 
 
-def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
+def collect_annotations_from_tu(
+    tu,
+    src_path: pathlib.Path,
+    project_root: pathlib.Path,
+    generated_root: pathlib.Path | None,
+) -> list:
     """Walk the AST and extract every METACC_TABLE / METACC_TABLE_ITEM
-    macro instantiation that belongs to a project file (not system headers).
-
-    FIXED: current_func is now explicitly reset to None when the walk enters
-    a top-level non-function declaration (struct / enum / union), so that a
-    stale function pointer cannot be confused with file-scope annotations.
+    macro instantiation that belongs to a project source file.
     """
     annotations: list = []
     main = str(src_path.resolve())
     project_files = {main}
     for inc in tu.get_includes():
         inc_path = pathlib.Path(inc.include.name).resolve()
-        if not str(inc_path).startswith(("/usr", "/lib")):
+        if is_project_source_path(inc_path, project_root, generated_root):
             project_files.add(str(inc_path))
 
-    current_func = None
     for cursor in tu.cursor.walk_preorder():
-        # -- track enclosing function ----------------------------------
-        if cursor.kind == clang.CursorKind.FUNCTION_DECL:
-            current_func = cursor
-        elif cursor.kind in (
-            clang.CursorKind.STRUCT_DECL,
-            clang.CursorKind.ENUM_DECL,
-            clang.CursorKind.UNION_DECL,
-        ):
-            # Top-level declaration that is *not* a function – reset.
-            if (
-                cursor.semantic_parent is not None
-                and cursor.semantic_parent.kind
-                == clang.CursorKind.TRANSLATION_UNIT
-            ):
-                current_func = None
-
-        # -- only care about macro instantiations -----------------------
         if cursor.kind != clang.CursorKind.MACRO_INSTANTIATION:
             continue
 
@@ -550,31 +667,11 @@ def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
         if str(file_path) not in project_files:
             continue
 
-        func_name = None
-        func_start = None
-        func_end = None
-        if (
-            current_func is not None
-            and current_func.extent.start.file is not None
-            and current_func.extent.start.file.name == loc.file.name
-        ):
-            if (
-                current_func.extent.start.line
-                <= loc.line
-                <= current_func.extent.end.line
-            ):
-                func_name = current_func.spelling
-                func_start = current_func.extent.start.line
-                func_end = current_func.extent.end.line
-
         annotations.append({
             "kind": kind,
             "args": resolved_args,
             "file": str(file_path),
             "line": loc.line,
-            "func": func_name,
-            "func_start": func_start,
-            "func_end": func_end,
         })
     return annotations
 
@@ -586,22 +683,28 @@ def collect_annotations_from_tu(tu, src_path: pathlib.Path) -> list:
 _COMPILER_SYSTEM_INCLUDES: dict = {}
 
 
-def compiler_system_include_dirs(compiler: str) -> list:
+def source_language_for_path(path: str | pathlib.Path) -> str:
+    suffix = pathlib.Path(path).suffix.lower()
+    return "c++" if suffix in CXX_EXTENSIONS else "c"
+
+
+def compiler_system_include_dirs(compiler: str, language: str = "c") -> list:
     if not compiler:
         return []
-    cached = _COMPILER_SYSTEM_INCLUDES.get(compiler)
+    cache_key = (compiler, language)
+    cached = _COMPILER_SYSTEM_INCLUDES.get(cache_key)
     if cached is not None:
         return cached
     try:
         proc = subprocess.run(
-            [compiler, "-E", "-x", "c", "-", "-v"],
+            [compiler, "-E", "-x", language, "-", "-v"],
             input="",
             text=True,
             capture_output=True,
             check=False,
         )
     except OSError:
-        _COMPILER_SYSTEM_INCLUDES[compiler] = []
+        _COMPILER_SYSTEM_INCLUDES[cache_key] = []
         return []
     includes = []
     capture = False
@@ -618,7 +721,7 @@ def compiler_system_include_dirs(compiler: str) -> list:
             continue
         if path not in includes:
             includes.append(path)
-    _COMPILER_SYSTEM_INCLUDES[compiler] = includes
+    _COMPILER_SYSTEM_INCLUDES[cache_key] = includes
     return includes
 
 
@@ -649,59 +752,93 @@ def sanitize_riscv_march(march: str) -> str:
 
 
 _KEEP_ARG_PREFIXES = (
-    "-D", "-U", "-I", "-isystem", "-iquote", "-idirafter",
-    "-include", "-imacros", "-std=", "-x", "--target=", "-mabi=",
-    "-fpack-struct",
+    "-D", "-U", "-std=", "--target=", "-mabi=", "-march=",
+    "-mcpu=", "-mtune=", "-mfpu=", "-mfloat-abi=", "-fpack-struct",
 )
 _KEEP_ARG_EXACT = {
     "-nostdinc", "-nostdinc++", "-fshort-enums", "-fshort-wchar",
-    "-funsigned-char", "-fsigned-char", "-fno-common",
+    "-funsigned-char", "-fsigned-char", "-fno-common", "-mthumb",
+    "-mcmse", "-mno-unaligned-access",
 }
 _KEEP_ARG_PAIR_FLAGS = {
-    "-D", "-U", "-I", "-isystem", "-iquote", "-idirafter",
-    "-include", "-imacros", "-x", "--target",
+    "-D", "-U", "-x", "--target",
+}
+_DROP_ARG_PAIR_FLAGS = {
+    "-o", "-MF", "-MT", "-MQ",
+}
+_DROP_ARG_EXACT = {
+    "-c", "-w", "-mdiv", "-MMD", "-MD", "-MP",
 }
 
 
-def clang_args_from_entry(entry: dict, metacc_h: pathlib.Path) -> list:
+def clang_args_from_entry(
+    entry: dict,
+    metacc_h: pathlib.Path,
+    project_root: pathlib.Path,
+) -> list:
     """Convert a compile_commands.json entry into libclang-compatible args."""
-    raw = (
-        shlex.split(entry["command"])
-        if entry.get("command")
-        else list(entry.get("arguments", []))
-    )
+    raw = compile_entry_raw_args(entry)
+    base_dir = compile_entry_directory(entry, project_root)
     compiler = raw[0] if raw else ""
     src_file = entry.get("file", "")
     keep: list = []
-    skip_next = False
-    for arg in raw[1:]:
-        if skip_next:
-            skip_next = False
+    src_candidates = {src_file}
+    if src_file:
+        src_path = pathlib.Path(src_file)
+        if not src_path.is_absolute():
+            src_candidates.add(str((base_dir / src_path).resolve()))
+
+    i = 1
+    while i < len(raw):
+        arg = raw[i]
+        if arg in _DROP_ARG_EXACT:
+            i += 1
             continue
-        if arg in ("-c", "-w", "-mdiv"):
+        if arg in _DROP_ARG_PAIR_FLAGS:
+            i += 2
             continue
         if arg.startswith("-march="):
             march = arg.split("=", 1)[1].strip()
             keep.append(f"-march={sanitize_riscv_march(march)}")
+            i += 1
             continue
-        if arg in ("-o", "-MF", "-MT", "-MQ"):
-            skip_next = True
+        if arg in _PATH_PAIR_FLAGS:
+            if i + 1 < len(raw):
+                value = raw[i + 1]
+                keep.append(arg)
+                keep.append(_path_arg(value, base_dir))
+            i += 2
             continue
-        if arg in ("-MMD", "-MD", "-MP"):
+        matched_joined_path = False
+        for flag in _INCLUDE_DIR_PAIR_FLAGS:
+            if arg.startswith(flag) and len(arg) > len(flag):
+                keep.append(flag)
+                keep.append(_path_arg(arg[len(flag):], base_dir))
+                matched_joined_path = True
+                break
+        if matched_joined_path:
+            i += 1
             continue
         if arg in _KEEP_ARG_PAIR_FLAGS:
             keep.append(arg)
-            skip_next = True
+            if i + 1 < len(raw):
+                keep.append(raw[i + 1])
+            i += 2
             continue
-        if arg == src_file:
+        if arg in src_candidates:
+            i += 1
             continue
         if arg in _KEEP_ARG_EXACT:
             keep.append(arg)
+            i += 1
             continue
         if any(arg.startswith(p) for p in _KEEP_ARG_PREFIXES):
             keep.append(arg)
+            i += 1
             continue
-    for inc in compiler_system_include_dirs(compiler):
+        i += 1
+    language = source_language_for_path(src_file)
+    for inc in compiler_system_include_dirs(compiler, language):
         keep += ["-isystem", inc]
     target = infer_clang_target(compiler, raw)
     if target:
@@ -731,22 +868,16 @@ def _process_file_worker(
     project_root = pathlib.Path(project_root_str)
     metacc_h = pathlib.Path(metacc_h_str)
     src = pathlib.Path(src_str)
+    generated_root = (
+        pathlib.Path(generated_root_str) if generated_root_str else None
+    )
+    include_dirs = include_search_dirs_from_entry(entry, project_root)
 
     has_metacc_text, text_deps = source_tree_might_contain_metacc_text(
-        src, project_root
+        src, project_root, include_dirs
     )
     if not has_metacc_text:
-        deps = []
-        for dep_path in text_deps:
-            try:
-                st = dep_path.stat()
-                deps.append({
-                    "path": str(dep_path),
-                    "mtime_ns": st.st_mtime_ns,
-                    "size": st.st_size,
-                })
-            except OSError:
-                pass
+        deps = dependencies_for_paths(text_deps)
         return {
             "src": src_str,
             "annotations": [],
@@ -754,10 +885,11 @@ def _process_file_worker(
             "protos": {},
             "deps": deps,
             "matched": False,
+            "cacheable": bool(deps),
         }
 
     index = clang.Index.create()
-    args = clang_args_from_entry(entry, metacc_h)
+    args = clang_args_from_entry(entry, metacc_h, project_root)
 
     try:
         tu = index.parse(
@@ -776,6 +908,7 @@ def _process_file_worker(
             "protos": {},
             "deps": [],
             "matched": False,
+            "cacheable": False,
         }
 
     if not tu:
@@ -786,6 +919,7 @@ def _process_file_worker(
             "protos": {},
             "deps": [],
             "matched": False,
+            "cacheable": False,
         }
 
     has_fatal_errors = False
@@ -806,44 +940,25 @@ def _process_file_worker(
         )
 
     # Track dependencies (for cache invalidation), including metacc.h itself.
-    deps: list = []
-    try:
-        st = metacc_h.stat()
-        deps.append({
-            "path": str(metacc_h),
-            "mtime_ns": st.st_mtime_ns,
-            "size": st.st_size,
-        })
-    except OSError:
-        pass
+    dep_paths = [metacc_h]
     for inc in tu.get_includes():
-        p = pathlib.Path(inc.include.name)
-        try:
-            st = p.stat()
-            deps.append({
-                "path": str(p),
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
-            })
-        except OSError:
-            pass
-    try:
-        st = src.stat()
-        deps.append({
-            "path": str(src),
-            "mtime_ns": st.st_mtime_ns,
-            "size": st.st_size,
-        })
-    except OSError:
-        pass
+        dep_paths.append(pathlib.Path(inc.include.name))
+    dep_paths.append(src)
+    deps = dependencies_for_paths(dep_paths)
 
     return {
         "src": src_str,
-        "annotations": collect_annotations_from_tu(tu, src),
+        "annotations": collect_annotations_from_tu(
+            tu,
+            src,
+            project_root,
+            generated_root,
+        ),
         "enums": collect_enums(tu),
         "protos": collect_nonstatic_functions(tu),
         "deps": deps,
         "matched": True,
+        "cacheable": bool(deps),
     }
 
 
@@ -855,23 +970,47 @@ class ProjectModel:
     def __init__(self, root: pathlib.Path, file_results: list):
         self.root = root
         self.enums: dict = {}
+        self.enum_values: dict = {}
         self.protos: dict = {}
         self.annotations: list = []
+        self._annotations_by_kind: dict[str, list] = {}
+        seen_annotations: set[tuple] = set()
+
         for r in file_results:
             self.enums.update(r.get("enums", {}))
             self.protos.update(r.get("protos", {}))
             for a in r.get("annotations", []):
-                self.annotations.append({**a, "src": r["src"]})
+                ann = {**a, "src": r["src"]}
+                key = (
+                    ann.get("kind"),
+                    ann.get("file"),
+                    ann.get("line"),
+                    tuple(ann.get("args", [])),
+                )
+                if key in seen_annotations:
+                    continue
+                seen_annotations.add(key)
+                self.annotations.append(ann)
+                self._annotations_by_kind.setdefault(
+                    ann["kind"], []
+                ).append(ann)
+
+        for vals in self.enums.values():
+            self.enum_values.update(vals)
 
     def annotations_of_kind(self, *kinds) -> list:
-        return [a for a in self.annotations if a["kind"] in kinds]
+        if len(kinds) == 1:
+            return list(self._annotations_by_kind.get(kinds[0], []))
+        out = []
+        for kind in kinds:
+            out.extend(self._annotations_by_kind.get(kind, []))
+        return out
 
     def resolve_enum_value(self, token: str) -> tuple:
         """Return (0, int_value) for numeric/enum tokens, else (1, token).
 
-        FIXED: strips C integer suffixes (u, U, l, L, ll, LL, ul, …) before
-        attempting int() conversion so that ``10u`` and ``0xFFUL`` sort as
-        numbers rather than strings.
+        Strips C integer suffixes before int() conversion so that ``10u`` and
+        ``0xFFUL`` sort as numbers rather than strings.
         """
         t = token.strip()
         # Strip common C integer-literal suffixes.
@@ -880,9 +1019,8 @@ class ProjectModel:
             return (0, int(stripped, 0))
         except ValueError:
             pass
-        for vals in self.enums.values():
-            if t in vals:
-                return (0, vals[t])
+        if t in self.enum_values:
+            return (0, self.enum_values[t])
         return (1, t)
 
 
@@ -901,7 +1039,7 @@ def scan_project(
     entries_by_src: dict = {}
     for entry in compile_commands:
         src = entry.get("file", "")
-        if src.endswith((".c", ".h")):
+        if pathlib.Path(src).suffix.lower() in SOURCE_EXTENSIONS:
             p = pathlib.Path(src)
             if not p.is_absolute():
                 p = (
@@ -911,23 +1049,22 @@ def scan_project(
                     / p
                 ).resolve()
             # Exclude previously-generated files.
-            if generated_root is not None:
-                try:
-                    p.relative_to(generated_root)
-                    continue
-                except ValueError:
-                    pass
+            if is_generated_path(p, generated_root):
+                continue
             entries_by_src[str(p)] = entry
 
     results: list = []
     tasks_to_run: dict = {}
+    cache_hits = 0
 
     for src_str, entry in entries_by_src.items():
+        source_dep = path_dependency(pathlib.Path(src_str))
         obj = {
             "v": CACHE_VERSION,
             "file": src_str,
-            "args": entry.get("arguments", [])
-            or shlex.split(entry.get("command", "")),
+            "source": source_dep,
+            "metacc_h": str(metacc_h),
+            "args": clang_args_from_entry(entry, metacc_h, project_root),
         }
         key = hashlib.sha256(
             json.dumps(obj, sort_keys=True).encode()
@@ -943,8 +1080,9 @@ def scan_project(
                 pass
 
         if cached:
-            valid = True
-            for dep in cached.get("deps", []):
+            cached_deps = cached.get("deps", [])
+            valid = bool(cached_deps)
+            for dep in cached_deps:
                 try:
                     st = pathlib.Path(dep["path"]).stat()
                     if (
@@ -958,6 +1096,7 @@ def scan_project(
                     break
             if valid:
                 results.append({"src": src_str, **cached})
+                cache_hits += 1
                 continue
         tasks_to_run[src_str] = (entry, cp)
 
@@ -982,26 +1121,29 @@ def scan_project(
             for fut in concurrent.futures.as_completed(futures):
                 src_str, cache_path = futures[fut]
                 finished_count += 1
-                short_name = pathlib.Path(src_str).name
-                print(
-                    f"[metacc] [{finished_count}/{total_tasks}] "
-                    f"Parsing {short_name}...",
-                    flush=True,
-                )
                 try:
                     res = fut.result()
                     results.append(res)
-                    payload = {
-                        k: v for k, v in res.items() if k != "src"
-                    }
-                    tmp = cache_path.with_suffix(
-                        f".{os.getpid()}.tmp"
+                    short_name = pathlib.Path(src_str).name
+                    print(
+                        f"[metacc] [{finished_count}/{total_tasks}] "
+                        f"Parsed {short_name}",
+                        flush=True,
                     )
-                    tmp.write_text(
-                        json.dumps(payload, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    tmp.replace(cache_path)
+                    if res.get("cacheable", True):
+                        payload = {
+                            k: v
+                            for k, v in res.items()
+                            if k not in ("src", "cacheable")
+                        }
+                        tmp = cache_path.with_suffix(
+                            f".{os.getpid()}.tmp"
+                        )
+                        tmp.write_text(
+                            json.dumps(payload, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        tmp.replace(cache_path)
                 except Exception as e:
                     print(
                         f"[metacc] process error {src_str}: {e}",
@@ -1009,7 +1151,22 @@ def scan_project(
                         flush=True,
                     )
 
+    if entries_by_src:
+        parsed = len(tasks_to_run)
+        total = len(entries_by_src)
+        print(
+            f"[metacc] Scan summary: {total} source file(s), "
+            f"{cache_hits} cache hit(s), {parsed} parsed.",
+            flush=True,
+        )
+
     return ProjectModel(project_root, results)
+
+
+def normalize_jobs(jobs: int) -> int:
+    if jobs <= 0:
+        return max(1, os.cpu_count() or 1)
+    return jobs
 
 
 # ===========================================================================
@@ -1025,7 +1182,6 @@ def _write_if_changed(path: pathlib.Path, text: str):
 
 def companion_paths(
     owner_path: pathlib.Path,
-    project_root: pathlib.Path,
     generated_root: pathlib.Path | None,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     owner_abs = owner_path.resolve()
@@ -1043,7 +1199,7 @@ def companion_paths(
 
 
 def _render_generated_header(filename: str, body: str) -> str:
-    """FIXED: only includes <stdint.h> (required by uint32_t)."""
+    """Render the generated declaration header."""
     return (
         f"/**\n"
         f"*******************************************************************************\n"
@@ -1099,10 +1255,7 @@ def _render_generated_source(
         f"******************************************************************************\n"
         f"*/\n"
         f"#include \"{owner_include}\"\n"
-        f"#include \"{gen_header_include}\"\n"
-        f"#include <string.h>\n"
-        f"#include <stdio.h>\n"
-        f"#include <stdlib.h>\n\n"
+        f"#include \"{gen_header_include}\"\n\n"
         f"{body.strip()}\n"
     )
 
@@ -1125,14 +1278,11 @@ def _append_companion_fragment(
 
 def _flush_companion_fragments(
     buckets: dict,
-    project_root: pathlib.Path,
     generated_root: pathlib.Path | None,
 ):
     for bucket in buckets.values():
         owner_path = bucket["owner_path"]
-        h_path, c_path = companion_paths(
-            owner_path, project_root, generated_root
-        )
+        h_path, c_path = companion_paths(owner_path, generated_root)
         h_text = _render_generated_header(
             h_path.name,
             "\n\n".join(p for p in bucket["header_parts"] if p),
@@ -1153,6 +1303,16 @@ def _flush_companion_fragments(
         _write_if_changed(c_path, c_text)
 
 
+def annotation_location(ann: dict) -> str:
+    path = ann.get("file") or ann.get("src") or "<unknown>"
+    line = ann.get("line")
+    return f"{path}:{line}" if line is not None else str(path)
+
+
+def metacc_warning(message: str) -> None:
+    print(f"[metacc] warning: {message}", file=sys.stderr)
+
+
 # ===========================================================================
 # METACC_TABLE / METACC_TABLE_ITEM code generator
 # ===========================================================================
@@ -1167,17 +1327,46 @@ def run_table(
     for ann in model.annotations_of_kind("METACC_TABLE"):
         args = ann["args"]
         if len(args) < 2:
+            metacc_warning(
+                f"METACC_TABLE at {annotation_location(ann)} needs at "
+                f"least 2 args: name and type"
+            )
             continue
         name, type_name = args[0], args[1]
+        decl_loc = annotation_location(ann)
         if name in tables:
+            old = tables[name]
+            if (
+                old["decl_loc"] == decl_loc
+                and old["type"] == type_name
+                and old["decl_args"] == args[2:]
+            ):
+                continue
+            metacc_warning(
+                f"duplicate METACC_TABLE '{name}' at "
+                f"{decl_loc} ignored; first declaration is "
+                f"at {tables[name]['decl_loc']}"
+            )
             continue
         kv = parse_kv_args(args[2:])
         sort_col_raw = kv.get("sort_col", kv.get("col"))
-        sort_col = (
-            int(str(sort_col_raw), 0)
-            if sort_col_raw is not None
-            else None
-        )
+        sort_col = None
+        if sort_col_raw is not None:
+            try:
+                sort_col = int(str(sort_col_raw), 0)
+            except ValueError:
+                metacc_warning(
+                    f"METACC_TABLE '{name}' at {annotation_location(ann)} "
+                    f"has invalid sort_col '{sort_col_raw}'; falling back "
+                    f"to source-order sorting"
+                )
+            if sort_col is not None and sort_col < 0:
+                metacc_warning(
+                    f"METACC_TABLE '{name}' at {annotation_location(ann)} "
+                    f"has negative sort_col {sort_col}; falling back to "
+                    f"source-order sorting"
+                )
+                sort_col = None
         sort_desc = (
             str(kv.get("order", "asc")).strip().lower()
             in ("desc", "descending")
@@ -1187,14 +1376,26 @@ def run_table(
             "sort_col": sort_col,
             "sort_desc": sort_desc,
             "owner_src": ann.get("file", ann["src"]),
+            "decl_loc": decl_loc,
+            "decl_args": args[2:],
             "items": [],
         }
 
     for ann in model.annotations_of_kind("METACC_TABLE_ITEM"):
         args = ann["args"]
         if not args:
+            metacc_warning(
+                f"METACC_TABLE_ITEM at {annotation_location(ann)} needs "
+                f"at least the table name"
+            )
             continue
         arr_name = args[0]
+        if len(args) < 2:
+            metacc_warning(
+                f"METACC_TABLE_ITEM for '{arr_name}' at "
+                f"{annotation_location(ann)} has no initializer payload"
+            )
+            continue
         payload = ", ".join(args[1:])
         if arr_name in tables:
             tables[arr_name]["items"].append({
@@ -1217,29 +1418,50 @@ def run_table(
                 key=lambda x: (str(x["src"]), int(x["line"]))
             )
         else:
+            sort_key_cache: dict[tuple, tuple] = {}
+
             def _item_sort_key(item):
+                cache_key = (item["src"], item["line"], item["payload"])
+                cached = sort_key_cache.get(cache_key)
+                if cached is not None:
+                    return cached
                 parts = [
                     p.strip()
                     for p in split_top_level_commas(item["payload"])
                 ]
-                key_expr = (
-                    parts[sort_col].strip()
-                    if sort_col < len(parts)
-                    else ""
-                )
-                return (
+                if sort_col < len(parts):
+                    key_expr = parts[sort_col].strip()
+                else:
+                    key_expr = ""
+                    metacc_warning(
+                        f"METACC_TABLE '{name}' sort_col {sort_col} is "
+                        f"out of range for item at "
+                        f"{item['src']}:{item['line']}; treating key as empty"
+                    )
+                key = (
                     model.resolve_enum_value(key_expr),
                     key_expr,
                     str(item["src"]),
                     int(item["line"]),
                 )
+                sort_key_cache[cache_key] = key
+                return key
 
-            items.sort(key=_item_sort_key, reverse=sort_desc)
+            if sort_desc:
+                items.sort(key=lambda x: (str(x["src"]), int(x["line"])))
+                items.sort(
+                    key=lambda x: _item_sort_key(x)[:2],
+                    reverse=True,
+                )
+            else:
+                items.sort(key=_item_sort_key)
 
         proto_lines = []
+        seen_protos: set[str] = set()
         for item in items:
             for proto in item["protos"]:
-                if proto not in proto_lines:
+                if proto not in seen_protos:
+                    seen_protos.add(proto)
                     proto_lines.append(proto)
 
         h_lines = [
@@ -1271,13 +1493,17 @@ def run(
     generated_root: pathlib.Path | None,
 ) -> int:
     model = scan_project(
-        project_root, compile_commands, cache_dir, jobs, generated_root
+        project_root,
+        compile_commands,
+        cache_dir,
+        normalize_jobs(jobs),
+        generated_root,
     )
 
     companion_fragments: dict = {}
     run_table(model, companion_fragments, project_root, generated_root)
     _flush_companion_fragments(
-        companion_fragments, project_root, generated_root
+        companion_fragments, generated_root
     )
 
     # Detect orphan METACC_TABLE_ITEMs referencing undefined tables.
@@ -1286,22 +1512,25 @@ def run(
         for a in model.annotations_of_kind("METACC_TABLE")
         if a["args"]
     }
-    item_table_names = {
-        a["args"][0]
+    orphan_items = [
+        a
         for a in model.annotations_of_kind("METACC_TABLE_ITEM")
-        if a["args"]
-    }
-    orphans = item_table_names - table_names
-    for orphan in sorted(orphans):
-        print(
-            f"[metacc] warning: METACC_TABLE_ITEM references undefined "
-            f"METACC_TABLE '{orphan}'",
-            file=sys.stderr,
+        if a["args"] and a["args"][0] not in table_names
+    ]
+    orphans = {a["args"][0] for a in orphan_items}
+    for ann in sorted(
+        orphan_items,
+        key=lambda x: (x["args"][0], annotation_location(x)),
+    ):
+        metacc_warning(
+            f"METACC_TABLE_ITEM at {annotation_location(ann)} references "
+            f"undefined METACC_TABLE '{ann['args'][0]}'"
         )
 
     if orphans:
         print(
-            f"[metacc] Completed with {len(orphans)} warning(s).",
+            f"[metacc] Completed with {len(orphan_items)} undefined "
+            f"table item warning(s) across {len(orphans)} table(s).",
             file=sys.stderr,
         )
         return 1
@@ -1335,7 +1564,7 @@ def main():
     )
     parser.add_argument(
         "-j", "--jobs", type=int, default=4,
-        help="Process pool worker count",
+        help="Process pool worker count. Use 0 for os.cpu_count().",
     )
     parser.add_argument(
         "-g", "--generated-root", default=None,
@@ -1387,7 +1616,29 @@ def main():
         )
         return 2
 
-    compile_commands = json.loads(cc_path.read_text(encoding="utf-8"))
+    try:
+        compile_commands = json.loads(cc_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(
+            f"[metacc] error: failed to read compilation database "
+            f"{cc_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    except json.JSONDecodeError as exc:
+        print(
+            f"[metacc] error: invalid JSON in compilation database "
+            f"{cc_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    if not isinstance(compile_commands, list):
+        print(
+            f"[metacc] error: compilation database {cc_path} must be a "
+            f"JSON array.",
+            file=sys.stderr,
+        )
+        return 2
 
     cache_dir = (
         resolve_output_path(args.cache_dir, project_root)
@@ -1403,10 +1654,14 @@ def main():
     )
     generated_root.mkdir(parents=True, exist_ok=True)
 
-    return run(
-        project_root, compile_commands, cache_dir, args.jobs,
-        generated_root,
-    )
+    try:
+        return run(
+            project_root, compile_commands, cache_dir, args.jobs,
+            generated_root,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"[metacc] error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

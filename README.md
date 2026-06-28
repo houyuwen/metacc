@@ -1,184 +1,498 @@
-# metacc 🚀
+# metacc: 用 libclang 给 C 项目做一层轻量静态元编程
 
-**基于 libclang 的静态元编程轻量化 C 语言代码生成工具链**
+很多 C 项目都会在规模变大以后遇到同一个问题：模块越来越多，注册点越来越分散，但运行时并不想引入复杂的动态注册机制。
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-green.svg)](https://www.python.org/)
-[![Embedded](https://img.shields.io/badge/Embedded-MCU%20%7C%20RTOS-orange.svg)](https://en.wikipedia.org/wiki/Embedded_system)
+比如一个嵌入式平台里可能有这些需求：
 
+- 各个模块在自己的 `.c` 文件里声明初始化函数，最终按优先级组成一张启动表。
+- 不同板级文件各自贡献设备 provider，平台层按优先级统一遍历。
+- 事件总线的订阅者分散在测试或业务模块中，构建时自动收拢成静态数组。
+- 数据中心的 slot 分布在多个翻译单元里，但运行时只想访问一张只读表。
 
-`metacc` 是一款专为极致性能嵌入式固件、MCU SDK 及跨模块架构解耦设计的静态元编程工具。它利用 `libclang` 强大的 AST（抽象语法树）分析能力，在编译前置期自动提取 C 语言源文件中的原始静态标记 Token，全自动交叉汇编出强类型静态数据检索表。
+最直接的做法是手写一个全局数组。但这会把所有模块重新耦合到一个中心文件里：每新增一个模块，都要去修改那张数组。另一种做法是运行时注册，但在 MCU、RTOS 或偏底层 SDK 里，这通常意味着额外的初始化顺序、锁、链表、堆内存或不可控的启动路径。
 
-运行时彻底消灭一切动态堆内存分配（`malloc`），核心检索算法全面压榨至二分效率，直击嵌入式第一性原理。
+`metacc` 选择第三条路：在源码里放非常薄的标记宏，构建时用 `libclang` 扫描所有编译单元，把分散的条目生成普通 C 源码。
 
----
+最后得到的是普通的：
 
-## 💡 设计哲学与核心限制
+```c
+extern const my_entry_t my_table[];
+extern const uint32_t my_table_count;
+```
 
-> [!IMPORTANT]
-> **关键规范：必须直调原生 Token，不支持宏包装别名。**
-> 由于本工具采用轻量级的静态语义提取，**不会像常规 C 预处理器那样执行宏展开**。这意味着在 C 语言中对原生宏进行二次包装（如 `#define REG_CMD(name) METACC_TABLE_ITEM(...)`）是**无法被工具识别的**。
->
-> 任何开发人员编写业务 `.c` 代码时，必须彻底遵循**不加任何中间宏外壳、直接调用原生标记**的原则。
+没有运行时注册，没有堆内存，没有链接脚本段，也没有编译器私有 section 约定。它只是把“人工维护表”的动作交给构建期工具来做。
 
-这种设计确保了 `metacc` 不需要考虑繁杂的 C 语言宏依赖拓扑，带来了 100% 的词法抓取确定性与极致紧凑的编译期安全。
+## 核心模型
 
----
+`metacc` 的核心模型很小：声明一张表，再从多个编译单元向这张表追加条目。
 
-## 📦 极简扁平化仓库结构
+它主要由两个标记宏组成：
 
+```c
+METACC_TABLE(name, type, ...)
+METACC_TABLE_ITEM(name, ...)
+```
 
-项目采用现代化轻量扁平布局（Modern Flat Layout），克隆后**原地不动、零污染引用**。
+其中：
+
+- `METACC_TABLE` 声明一张表，通常放在拥有该表类型定义的头文件里。
+- `METACC_TABLE_ITEM` 向表里追加一个条目，通常分散写在各个 `.c` 或测试 `.cpp` 翻译单元里。
+- 工具会为每张表生成一个 `metacc_<owner>.h` 和 `metacc_<owner>.c`。
+- 生成的 `.c` 会包含表声明所在的 owner header，以及对应的 generated header。
+- 每张表生成两个符号：`const <type> <name>[]` 和 `const uint32_t <name>_count`。
+
+为了让生成结果稳定、可读，业务侧推荐直接使用这两个原生标记宏。条目里引用的回调函数或对象保持外部可链接，生成文件就能像普通业务代码一样引用它们。
+
+## 三个典型示例
+
+### 示例一: 模块初始化表
+
+假设项目希望各个模块在自己的源文件里声明初始化入口，最终由构建系统生成一张按优先级排序的启动表。
+
+先在头文件里定义条目类型，并声明表：
+
+```c
+#pragma once
+
+#include <stdint.h>
+#include "metacc.h"
+
+typedef struct {
+    uint8_t level;
+    const char *name;
+    int (*init)(void);
+    void (*exit)(void);
+} module_init_entry_t;
+
+METACC_TABLE(module_init, module_init_entry_t, sort_col = 0, order = asc)
+```
+
+然后任意 `.c` 文件都可以贡献条目：
+
+```c
+#include "module_init.h"
+
+int device_init(void);
+void device_exit(void);
+
+METACC_TABLE_ITEM(
+    module_init,
+    20,
+    "device",
+    device_init,
+    device_exit
+)
+```
+
+构建后，`metacc` 会生成类似这样的 C 代码：
+
+```c
+#include "../../../include/module_init.h"
+#include "../include/metacc_module_init.h"
+
+int device_init(void);
+void device_exit(void);
+
+const module_init_entry_t module_init[] = {
+    {20, "device", device_init, device_exit},
+};
+const uint32_t module_init_count = 1u;
+```
+
+对业务代码来说，这就是一张普通的只读数组：
+
+```c
+for (uint32_t i = 0; i < module_init_count; ++i) {
+    module_init[i].init();
+}
+```
+
+### 示例二: 设备树 provider 表
+
+另一个常见场景是设备树或板级设备表。每个板级文件静态定义自己的设备实例，再提供一个 provider 函数按索引返回设备。平台层只关心最终生成的 provider 表，不需要知道这些 provider 分散在哪些源文件里。
+
+表声明可以这样写：
+
+```c
+typedef const struct device *(*plat_device_provider_t)(size_t index);
+
+typedef struct {
+    uint8_t priority;
+    plat_device_provider_t provider;
+} plat_devicetree_provider_entry_t;
+
+METACC_TABLE(device_tree, plat_devicetree_provider_entry_t, sort_col = 0, order = asc)
+```
+
+某个板级文件贡献自己的 UART provider：
+
+```c
+const struct device *board_uart_provider(size_t index);
+
+METACC_TABLE_ITEM(
+    device_tree,
+    PLAT_DEVICETREE_PRIO_UART,
+    board_uart_provider
+)
+```
+
+构建后生成的 `device_tree[]` 会按 `priority` 排序。平台层可以基于这张表实现设备查找、初始化和反初始化：查找时遍历 provider 匹配设备名，初始化时按优先级顺序执行，释放时按反向顺序执行。
+
+这个例子里，`metacc` 解决的是板级解耦问题。新增一个设备 provider 时，不需要修改中心数组；provider 写在对应板级文件里，构建期自动进入 `device_tree[]`。
+
+### 示例三: 事件总线订阅表
+
+事件总线适合拓扑相对固定的内部事件，例如链路状态变化、传感器数据到达、模块健康状态更新。每个模块在自己的源文件里声明订阅关系，构建期生成最终订阅表。
+
+订阅者结构可以这样定义：
+
+```c
+typedef struct eventbus_subscriber {
+    eventbus_event_t event;
+    void (*cb)(const void *data, size_t len, void *user_data);
+    void *user_data;
+} eventbus_subscriber_t;
+
+METACC_TABLE(eventbus_subscribers, eventbus_subscriber_t, sort_col = 0, order = asc)
+```
+
+任意模块可以在自己的翻译单元里追加订阅者：
+
+```c
+void alpha_cb(const void *data, size_t len, void *user_data);
+void beta_cb(const void *data, size_t len, void *user_data);
+
+METACC_TABLE_ITEM(eventbus_subscribers, EVENTBUS_EVENT_ALPHA, alpha_cb, NULL)
+METACC_TABLE_ITEM(eventbus_subscribers, EVENTBUS_EVENT_BETA, beta_cb, NULL)
+```
+
+生成结果是一张按 `event` 排序的 `eventbus_subscribers[]`。`eventbus_publish()` 先用 lower bound 找到某个事件的第一个订阅者，再顺序通知同一事件下的所有回调。查找成本是 `O(log N)`，通知成本是 `O(K)`，其中 `K` 是该事件的订阅者数量。
+
+这个例子里，`metacc` 解决的是事件拓扑维护问题。发布者不需要知道订阅者在哪个文件里，订阅者也不需要调用运行时注册接口；构建期生成的静态表就是最终分发拓扑。
+
+## 宏参数语义
+
+### METACC_TABLE
+
+```c
+METACC_TABLE(table_name, item_type, sort_col = 0, order = asc)
+```
+
+前两个参数是必需的。
+
+- `table_name`：生成的数组符号名。
+- `item_type`：数组元素类型。
+
+可选参数：
+
+- `sort_col` 或 `col`：按第几个 payload 字段排序，使用从 0 开始的索引。
+- `order`：`asc` 或 `desc`，默认 `asc`。
+
+如果没有 `sort_col`，条目会按源码路径和行号排序。这适合不关心优先级、只想稳定输出的表。
+
+如果设置了 `sort_col`，工具会尝试把该字段解析为整数或枚举常量，再排序。它支持常见 C 整数字面量后缀，比如 `1u`、`0x10UL`。如果字段不是数字也不是已知枚举，会退回字符串排序。
+
+### METACC_TABLE_ITEM
+
+```c
+METACC_TABLE_ITEM(table_name, field0, field1, field2, ...)
+```
+
+第一个参数是目标表名，后面的 payload 会成为数组元素初始化内容。
+
+如果 payload 只有一个顶层参数，生成时不会额外套花括号：
+
+```c
+METACC_TABLE_ITEM(callbacks, on_event)
+```
+
+生成：
+
+```c
+const callback_t callbacks[] = {
+    on_event,
+};
+```
+
+如果 payload 有多个顶层参数，会生成聚合初始化：
+
+```c
+METACC_TABLE_ITEM(module_init, 20, "device", device_init, device_exit)
+```
+
+生成：
+
+```c
+const module_init_entry_t module_init[] = {
+    {20, "device", device_init, device_exit},
+};
+```
+
+## 为什么不用运行时注册
+
+运行时注册在桌面程序里很常见，但在嵌入式或底层 SDK 中往往带来额外复杂度。
+
+注册函数需要被调用，就会引入初始化顺序问题。注册容器需要存储，就会引入数组容量、链表、堆内存或锁。注册发生在运行时，也意味着错误发现更晚：某个模块忘了调用注册函数，可能要到系统启动后才暴露。
+
+`metacc` 把这件事提前到构建期。
+
+源码里只留下声明：
+
+```c
+METACC_TABLE_ITEM(...)
+```
+
+构建时把它们收集起来：
+
+```c
+const entry_t table[] = {
+    ...
+};
+```
+
+运行时只读数组即可。没有注册动作，也没有注册失败路径。
+
+## 为什么用 libclang，而不是正则扫源码
+
+`metacc` 会做一层快速文本预筛，但真正提取宏实例依赖 `libclang`。
+
+原因很简单：C 项目里的源码形态并不单纯。一个文件可能通过 `-I` 引入头文件，头文件还会再 include 其它头文件。宏参数里可能有函数指针、字符串、聚合初始化、括号表达式。单纯正则很容易在这些地方出错。
+
+当前实现的处理方式是：
+
+1. 从 `compile_commands.json` 读取每个编译单元的真实编译参数。
+2. 根据 `-I`、`-iquote`、`-isystem` 等参数做快速 include 预扫，跳过完全不含 `METACC_*` 的文件。
+3. 对可能含有标记的编译单元调用 `libclang`，读取宏实例和 enum 值。
+4. 只收集 `project_root` 内的注解，并排除已生成目录，避免外部依赖或旧生成物污染结果。
+5. 将结果按表名归并、排序、去重、生成 C/H 文件。
+
+这也是为什么推荐通过 CMake 开启 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`。工具需要知道源码在项目里真实是怎么被编译的。
+
+## 生成目录和缓存
+
+默认输出目录：
 
 ```text
-metacc/
-├── .gitignore          # 隔离缓存及编译中间件
-├── LICENSE             # Apache-2.0 许可证
-├── README.md           # 本说明文档
-├── pyproject.toml      # 现代 Python 依赖锁定与全局 CLI 映射配置文件
-├── metacc.py           # 宿主机工具：Python 核心解析与渲染脚本
-└── metacc.h            # 目标机内核：C 语言原生 Token 声明头文件 (留在原地)
+<project_root>/build/metacc_files/
+  include/
+    metacc_<owner>.h
+  src/
+    metacc_<owner>.c
 ```
 
+默认缓存目录：
 
-## 🛠️ 9大核心元编程运行时服务
+```text
+<project_root>/build/.metacc/.cache/
+```
 
-通过在业务层直调原生的元编程 Token，工具链会自动生成对应的静态数据库。所有组件均已彻底解耦为独立的 .c/.h 模块：
+缓存按编译单元保存，依赖文件的 `mtime` 和大小变化会触发失效。构建规则直接以真实生成的 `.c/.h` 文件作为输出，首次构建会产出文件，后续增量构建可以复用未变化的解析结果。
 
-| 编号 | 核心服务 | 模块原生 Token | 运行时检索算法与开销 |
-|---|---|---|---|
-| 1 | 自动初始化流水线 (Auto-Init) | METACC_TABLE / _ITEM | 编译期按字段优先级排序，运行时 O(1) 顺序遍历执行 |
-| 2 | 强类型硬件设备表 (Device Table) | METACC_TABLE / _ITEM | 根据外设全局唯一 ID 进行 O(log N) 编译期二分检索排序 |
-| 3 | 静态分布式事件总线 (Event Bus) | METACC_TABLE / _ITEM | 支持多路多订阅静态拓扑，索引表 O(log N) 路由分发 |
-| 4 | 结构体字段反射 (Reflection) | METACC_STRUCT | 自动化计算字段名称、类型偏置及大小，免除手写反射对齐表 |
-| 5 | 双向枚举字符串转换 (Enum Mapping) | METACC_ENUM | 自动生成 ToString 和 FromString 双向边界审计反射安全接口 |
-| 6 | 零开销二进制序列化 (Serialize) | METACC_SERIALIZE | 针对特定结构体自动吐出零开销、免内存对齐冲突的 Pack/Unpack 静态流代码 |
-| 7 | 哈希 Shell 命令行 (Hash Shell) | METACC_SHELL | 静态提取注册命令，参数类型自动安全转换，包装层 O(log N) 极速分发 |
-| 8 | 解耦多态虚表 (Mock VTable Mux) | METACC_INTERFACE | 针对 C 抽象接口结构体一键吐出高保真单元测试 Mock 实体及调用计数器 |
-| 9 | 编译期单向哈希 (FNV-1a Hash) | METACC_HASH | 在编译期全自动将指定明文字符串降维解算为固定 32 位整型哈希，斩断 RAM 字符串空间占用 |
+## 命令行使用
 
-## 🚀 宿主机快速开始 (Host Setup)
-
-1. 依赖与一键本地安装
-
-项目基于现代 Python 包装标准（PEP 517/621）。确保您的宿主机已正确安装系统级 LLVM 运行库。
-
-在 metacc 仓库根目录下直接执行：
+源码模式：
 
 ```bash
-sudo apt update
-sudo apt install libclang-18-dev
-python3 -m venv venv
-source venv/bin/activate
-pip install -e .
+tools/metacc/venv/bin/python tools/metacc/metacc.py \
+  -c build/compile_commands.json \
+  -p . \
+  -g build/metacc_files \
+  -d build/.metacc/.cache \
+  -j 4
 ```
 
-该命令会自动利用 pyproject.toml 的声明拉取 Python clang 绑定，并在系统环境变量中无缝注册全局快捷命令 metacc。
+发布包模式：
 
-## ⚓ 下游 C 工程“零污染”原地集成规范
+```bash
+tools/metacc/release/metacc \
+  -c build/compile_commands.json \
+  -p . \
+  -g build/metacc_files \
+  -d build/.metacc/.cache \
+  -j 4
+```
 
-严禁将 metacc.h 拷贝出仓库！请通过编译器的包含路径（-I）实现单源真理（Single Source of Truth）。
+参数说明：
 
-CMake 环境集成示范：在您的 MCU / 嵌入式大框架项目的 CMakeLists.txt 中引入以下全自动前置生成钩子：
+- `-c, --compile-commands`：`compile_commands.json` 路径。不传时会尝试自动查找。
+- `-p, --project-root`：项目根目录。工具只会收集该目录内的注解。
+- `-g, --generated-root`：生成文件根目录，默认是 `project_root/build/metacc_files`。
+- `-d, --cache-dir`：缓存目录，默认是 `project_root/build/.metacc/.cache`。
+- `-j, --jobs`：解析进程数。传 `0` 表示使用 `os.cpu_count()`。
+
+## 在 CMake 项目中集成
+
+最关键的前提是打开编译数据库：
 
 ```cmake
-# 1. 指定全局元编程工具仓的相对克隆路径
-set(METACC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metacc)
-
-# 2. 原地引入头文件路径 (绝不拷贝文件)
-target_include_directories(${PROJECT_NAME} PRIVATE ${METACC_DIR})
-
-# 3. 配置前置构建钩子：自动化扫描应用层代码并吐出中间件元数据
-set(GENERATED_C_OUT ${CMAKE_CURRENT_BINARY_DIR}/metacc_out.c)
-
-add_custom_command(
-    OUTPUT ${GENERATED_C_OUT}
-    COMMAND metacc --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json --generated-root ${CMAKE_CURRENT_BINARY_DIR}
-    DEPENDS ${METACC_DIR}/metacc.py
-    COMMENT "Metacc: Executing AST scanning and metadata generation..."
-)
-
-# 4. 将自动生成的实体文件追加至您的固件编译列表中
-target_sources(${PROJECT_NAME} PRIVATE ${GENERATED_C_OUT} src/main.c)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 ```
 
-## 在上游工程（如 PlatNexus）中的集成与注意事项
+然后把 `metacc.h` 所在目录加入 include path。源码运行时通常引用 `tools/metacc`，发布包运行时则引用 `release`，两种方式都保持头文件来源清晰。
 
-当 `metacc` 被作为第三方工具目录放入更大工程（例如 `PlatNexus/tools/metacc`）时，默认的安装说明可能会造成混淆 —— 生成步骤依赖于一个位于工具目录下的 Python 虚拟环境（CMake 刚性约定使用 `tools/metacc/venv/bin/python`）。请按以下步骤在宿主工程中准备环境：
+一个简化版集成如下：
 
-1. 在宿主工程根目录下创建并激活工具专用虚拟环境（确保路径为 `tools/metacc/venv`）：
+```cmake
+set(METACC_DIR "${CMAKE_SOURCE_DIR}/tools/metacc")
+set(METACC_OUT_DIR "${CMAKE_BINARY_DIR}/metacc_files")
+set(METACC_CACHE_DIR "${CMAKE_BINARY_DIR}/.metacc/.cache")
+set(METACC_PYTHON "${METACC_DIR}/venv/bin/python")
+set(METACC_SCRIPT "${METACC_DIR}/metacc.py")
+
+set(METACC_GENERATED
+    "${METACC_OUT_DIR}/src/metacc_module_init.c"
+    "${METACC_OUT_DIR}/include/metacc_module_init.h"
+)
+
+add_custom_command(
+    OUTPUT ${METACC_GENERATED}
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${METACC_OUT_DIR}/src"
+            "${METACC_OUT_DIR}/include"
+            "${METACC_CACHE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${METACC_DIR}"
+            "${METACC_PYTHON}" "${METACC_SCRIPT}"
+            -c "${CMAKE_BINARY_DIR}/compile_commands.json"
+            -p "${CMAKE_SOURCE_DIR}"
+            -g "${METACC_OUT_DIR}"
+            -d "${METACC_CACHE_DIR}"
+    DEPENDS "${CMAKE_BINARY_DIR}/compile_commands.json"
+            "${METACC_SCRIPT}"
+            "${METACC_DIR}/metacc.h"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    VERBATIM
+)
+
+add_custom_target(metacc_codegen ALL DEPENDS ${METACC_GENERATED})
+
+target_include_directories(app PRIVATE
+    "${METACC_DIR}"
+    "${METACC_OUT_DIR}/include"
+)
+
+target_sources(app PRIVATE
+    "${METACC_OUT_DIR}/src/metacc_module_init.c"
+)
+
+add_dependencies(app metacc_codegen)
+```
+
+## 安装源码运行环境
+
+如果直接从源码运行，需要 Python 绑定和 native `libclang`。
+
+在 `tools/metacc` 下准备虚拟环境：
 
 ```bash
-cd /path/to/your/PlatNexus/tools/metacc
-sudo apt update
-sudo apt install libclang-18-dev    # 系统级 libclang 运行库
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-```
-
-2. 在该虚拟环境中安装 `metacc` 包与 Python 绑定依赖：
-
-```bash
 pip install -e .
-# 若在运行时遇到 "ModuleNotFoundError: No module named 'libclang'"，请单独安装 Python 绑定：
-pip install "libclang>=18.0.0"
 ```
 
-3. 验证：
+`pyproject.toml` 里声明了：
+
+```toml
+dependencies = [
+    "libclang>=18.0.0",
+]
+```
+
+在上面的 CMake 示例里，脚本使用：
+
+```text
+tools/metacc/venv/bin/python
+```
+
+如果你在其它项目里复用，要么保持这个路径约定，要么在自己的 CMake 封装里改成你自己的 Python 路径。
+
+## 打包发布
+
+发布使用 `package.sh`：
 
 ```bash
-${PWD}/venv/bin/python -c "import libclang; print('libclang', libclang.__version__)") || true
+cd tools/metacc
+./package.sh
 ```
 
-常见故障与排查
-- 错误：`ModuleNotFoundError: No module named 'libclang'` — 说明运行的 Python 解释器（通常是 `tools/metacc/venv/bin/python`）未安装 `libclang` Python 包，进入 `tools/metacc` 的虚拟环境并执行 `pip install libclang` 即可。
-- 注意：系统包 `libclang-18-dev` 提供的是 C 层的共享库，Python 侧仍需通过 `pip` 安装 `libclang` 绑定。
+发布目录是单层平铺结构：
 
-在完成以上准备后，回到宿主工程根目录并重新运行 CMake / Ninja 构建流程（CMake 的自定义命令会调用 `tools/metacc/venv/bin/python` 执行 `metacc.py`）。
+```text
+tools/metacc/release/
+  metacc
+  metacc.h
+  libclang.so
+  *.so
+```
 
+发布包可以直接作为归档根目录使用：
 
----
+- `metacc` 是命令行可执行文件。
+- `metacc.h` 是业务代码需要包含的标记宏头文件。
+- `libclang.so` 和可执行文件同级，发布时保持平铺结构即可。
 
-📝 **应用层业务直调示范 (Code Examples)**
+打包后可以直接验证：
 
-请直接在您的 .c 文件中尽情手写原生 Token。不需要任何前置宏别名包装：
+```bash
+tools/metacc/release/metacc --help
+```
 
-**示例 1: 自动初始化流水线追加**
+## 常见问题
+
+### 为什么没有生成我的条目
+
+优先检查这几件事：
+
+1. `METACC_TABLE_ITEM` 是否直接写在源码里，保持和示例一致的原生标记形式。
+2. 包含该源码的编译单元是否出现在 `compile_commands.json` 中。
+3. `--project-root` 是否设置正确。工具只收集 project root 内的注解。
+4. 相关头文件能否通过 compile command 里的 `-I`、`-iquote`、`-isystem` 找到。
+5. `METACC_TABLE_ITEM` 的第一个参数是否和 `METACC_TABLE` 的表名完全一致。
+
+### 为什么报 undefined METACC_TABLE
+
+说明某个 item 引用了不存在的表名。
+
+例如：
 
 ```c
-void bsp_flash_init(void) {
-    // 硬件底层 Flash 初始化逻辑
-}
-/* 告诉 metacc：将该函数丢入初始化流水线，优先级为 1，描述为 "flash_layer" */
-METACC_TABLE_ITEM(MetaccInitTable, bsp_flash_init, 1, "flash_layer")
+METACC_TABLE(my_table, item_t)
+METACC_TABLE_ITEM(my_tabel, 1, 2, 3)  /* 拼写错了 */
 ```
 
-**示例 2: 零开销哈希 Shell 命令行注册**
+工具会输出具体文件和行号。
+
+### 为什么函数有 prototype，但链接失败
+
+生成文件和业务 `.c` 是不同翻译单元。条目里引用的函数如果是 `static`，生成文件无法链接到它。
+
+解决方法是让该函数具备外部链接：
 
 ```c
-int cmd_reboot_handler(int argc, char *argv[]) {
-    NVIC_SystemReset();
-    return 0;
-}
-/* 注册全局命令 "reboot"，工具链自动包裹类型转换，生成帮助说明 */
-METACC_SHELL("reboot", cmd_reboot_handler, "Reset MCU system safely")
+int my_callback(void);
 ```
 
-**示例 3: 编译期 FNV-1a 单向字符串哈希**
+或者把条目设计成引用可见对象，而不是引用 `static` 私有符号。
 
-```c
-void log_message(uint32_t module_hash, const char* msg);
+### 为什么首次构建会解析很多文件
 
-void app_process(void) {
-    // 编译期全自动将 "SENSOR_MODULE" 静态解算为唯一 32 位整型数，不占用任何运行时 RAM 字符空间
-    METACC_HASH(MODULE_HASH_VAL, "SENSOR_MODULE")
-    log_message(MODULE_HASH_VAL, "Sensor data updated.");
-}
-```
+首次构建没有缓存，`metacc` 需要扫描 `compile_commands.json` 中的源文件。之后缓存会按依赖文件的修改时间和大小判断是否复用。
 
----
+当 `CACHE_VERSION`、工具脚本、编译参数或依赖文件变化时，对应缓存会失效，这是正常行为。
 
-📄 **开源许可证**
+### 为什么不用 section/linker set
 
-本项目基于 Apache License 2.0 许可证开源。详情请参阅 LICENSE 文件。
+section/linker set 是另一种常见方案，但它依赖编译器和链接脚本约定，跨平台行为更难统一。`metacc` 生成普通 C 数组，调试时可以直接打开生成的 `.c` 文件看最终顺序，更适合需要强可读构建产物的 SDK。
+
+## 适合使用的场景
+
+`metacc` 适合这些场景：
+
+- 表项分散在多个模块里，但运行时希望是一张静态数组。
+- 项目已经使用 CMake，并能生成 `compile_commands.json`。
+- 希望避免运行时注册机制。
+- 希望生成物是普通 C 源码，方便审查、调试和发布。
+
+## 许可证
+
+`metacc` 使用 Apache License 2.0。详见 `LICENSE`。

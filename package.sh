@@ -2,14 +2,12 @@
 # ==============================================================================
 # package.sh - Nuitka 高兼容单层扁平化打包脚本 (v10)
 # 所有产物（执行文件、Nuitka 依赖 .so、打包机 libclang、metacc.h）
-# 全部平铺放进 release/metacc/ 文件夹下。
-# 发布结构：tools/metacc/release/metacc/
+# 全部平铺放进 release/ 文件夹下。
+# 发布结构：tools/metacc/release/
 #   metacc          <- Nuitka 编译的可执行文件
 #   metacc.h        <- 运行时需要的注释宏头文件
-#   libclang.so     <- 打包机 libclang（与 release/metacc/ 内其他 .so 共存）
+#   libclang.so     <- 打包机 libclang（与 release/ 内其他 .so 共存）
 #   *.so            <- Nuitka 依赖的 Python 标准库 .so
-# libclang 同时以 libclang_native.so 复制到脚本同级目录，
-# 确保 metacc.py 源码运行与打包后的 metacc 可执行文件行为一致。
 # 编译完成后自动清理所有临时过程文件。
 # ==============================================================================
 set -e
@@ -17,10 +15,8 @@ set -e
 # 确保脚本在其所在目录下绝对对齐执行，并定位项目根目录
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CDPATH="" cd -- "$SCRIPT_DIR"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# 发布产物目标目录（Nuitka standalone 平铺到 release/metacc/）
-RELEASE_DIR="$SCRIPT_DIR/release"
-METACC_DIST_DIR="$RELEASE_DIR/metacc"
+# 发布产物目标目录（Nuitka standalone 平铺到 release/）
+METACC_DIST_DIR="$SCRIPT_DIR/release"
 
 echo "=============================================================================="
 echo "[metacc-pack] Starting Pure Single-Folder Standalone Compilation Flow..."
@@ -62,13 +58,20 @@ python3 -m nuitka \
     --output-filename=metacc \
     metacc.py
 
-# 整理产物：将独立目录内的所有文件全平铺转移到 release/metacc/ 中
+# 整理产物：将独立目录内的所有文件全平铺转移到 release/ 中
 echo "[metacc-pack] Moving all standalone artifacts directly to $METACC_DIST_DIR/..."
 mv build_tmp/metacc.dist/* "$METACC_DIST_DIR/"
 
+echo "[metacc-pack] Removing duplicated clang/native libclang payloads..."
+if [ -d "$METACC_DIST_DIR/clang/native" ]; then
+    find "$METACC_DIST_DIR/clang/native" -maxdepth 1 -type f -name 'libclang*' -exec rm -f {} +
+    rmdir "$METACC_DIST_DIR/clang/native" 2>/dev/null || true
+    rmdir "$METACC_DIST_DIR/clang" 2>/dev/null || true
+fi
+
 echo ""
 echo "------------------------------------------------------------------------------"
-echo "[Step 2/4] Copying metacc.h into release/metacc/..."
+echo "[Step 2/4] Copying metacc.h into release/..."
 echo "------------------------------------------------------------------------------"
 
 if [ -f "$SCRIPT_DIR/metacc.h" ]; then
@@ -107,20 +110,15 @@ print(found)
 if [ -n "$HOST_LIBCLANG" ] && [ -f "$HOST_LIBCLANG" ]; then
     echo "[metacc-pack] Found active host libclang: $HOST_LIBCLANG"
 
-    # 复制到 release/metacc/（打包产物开箱即用）
-    echo "[metacc-pack] Copying libclang to $METACC_DIST_DIR/ ..."
-    cp "$HOST_LIBCLANG" "$METACC_DIST_DIR/"
+    # 复制到 release/（打包产物开箱即用）
+    echo "[metacc-pack] Copying libclang to $METACC_DIST_DIR/libclang.so ..."
+    cp "$HOST_LIBCLANG" "$METACC_DIST_DIR/libclang.so"
+    rm -f "$METACC_DIST_DIR"/libclang-*.so*
 
-    # 同时复制到脚本同级目录（metacc.py 源码运行时也能找到同一份 libclang）
-    # 注意：必须命名为 libclang_native.so 而非 libclang.so，否则 Python 的
-    # "from libclang import cindex" 会误将其当作 Python 扩展模块加载。
-    echo "[metacc-pack] Copying libclang to $SCRIPT_DIR/libclang_native.so for source-runtime parity ..."
-    cp "$HOST_LIBCLANG" "$SCRIPT_DIR/libclang_native.so"
-
-    echo ">> [SUCCESS] libclang placed in both $METACC_DIST_DIR/ and $SCRIPT_DIR/libclang_native.so"
+    echo ">> [SUCCESS] libclang placed at $METACC_DIST_DIR/libclang.so"
 else
     echo "[metacc-pack] WARNING: Could not automatically locate libclang on this machine." >&2
-    echo "[metacc-pack] Please manually copy your local libclang into release/metacc/ and $SCRIPT_DIR/ later if needed." >&2
+    echo "[metacc-pack] Please manually copy your local libclang to release/libclang.so later if needed." >&2
 fi
 
 echo ""
@@ -136,7 +134,6 @@ echo "==========================================================================
 echo "[metacc-pack] PACKAGING COMPLETED SUCCESSFULLY!"
 echo ">> 发布目录:       $METACC_DIST_DIR/"
 echo ">> 可执行入口:     $METACC_DIST_DIR/metacc"
-echo ">> 运行命令:       tools/metacc/release/metacc/metacc -c <compile_commands> -p <project_root>"
+echo ">> 运行命令:       tools/metacc/release/metacc -c <compile_commands> -p <project_root>"
 echo ">> 运行时依赖:     $METACC_DIST_DIR/libclang.so  (all .so files co-located)"
-echo ">> 源码级 libclang: $SCRIPT_DIR/libclang_native.so   (metacc.py source parity)"
 echo "=============================================================================="

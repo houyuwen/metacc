@@ -1,5 +1,7 @@
 # metacc: 用 libclang 给 C 项目做一层轻量静态元编程
 
+项目地址：[houyuwen/metacc.git](https://github.com/houyuwen/metacc.git)
+
 很多 C 项目都会在规模变大以后遇到同一个问题：模块越来越多，注册点越来越分散，但运行时并不想引入复杂的动态注册机制。
 
 比如一个嵌入式平台里可能有这些需求：

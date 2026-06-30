@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: Apache-2.0
-"""metacc.py -- METACC_TABLE / METACC_TABLE_ITEM static-array code generator.
+"""metacc.py -- METACC static-array / enum code generator.
 
 Collects scattered METACC_TABLE_ITEM annotations across translation units and
-emits a sorted const array + count for each METACC_TABLE declaration.
+emits a sorted const array + count for each METACC_TABLE declaration.  Also
+collects METACC_ENUM_ITEM annotations and emits sorted typedef enums for each
+METACC_ENUM declaration.
 
 Backed by libclang.  Supports C integer-suffix stripping for sort keys and
 transitive-include scanning so that tables declared in nested headers are
@@ -86,13 +88,21 @@ del _configure_libclang_path
 # ---------------------------------------------------------------------------
 # constants
 # ---------------------------------------------------------------------------
-CACHE_VERSION = 16  # bumped: METACC_TABLE argument order is type, name
+CACHE_VERSION = 17  # bumped: add METACC_ENUM / METACC_ENUM_ITEM
 
-METACC_MACROS = {"METACC_TABLE", "METACC_TABLE_ITEM"}
-METACC_TEXT_RE = re.compile(r"\b(?:METACC_TABLE|METACC_TABLE_ITEM)\b")
+METACC_MACROS = {
+    "METACC_TABLE",
+    "METACC_TABLE_ITEM",
+    "METACC_ENUM",
+    "METACC_ENUM_ITEM",
+}
+METACC_TEXT_RE = re.compile(
+    r"\b(?:METACC_TABLE|METACC_TABLE_ITEM|METACC_ENUM|METACC_ENUM_ITEM)\b"
+)
 PROJECT_INCLUDE_RE = re.compile(
     r'^\s*#\s*include\s*["<]([^">]+)[">]', re.MULTILINE
 )
+C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SOURCE_EXTENSIONS = (
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
 )
@@ -502,7 +512,7 @@ def source_tree_might_contain_metacc_text(
     include_dirs: list[pathlib.Path] | None = None,
 ) -> tuple[bool, list[pathlib.Path]]:
     """Return (True, deps) if *src_path* or any transitively-included header
-    contains a METACC_TABLE / METACC_TABLE_ITEM macro reference.
+    contains a METACC marker macro reference.
 
     Follows transitive #include chains so that a table declared in a nested
     header (a.c -> b.h -> c.h) is not silently skipped.
@@ -640,8 +650,8 @@ def collect_annotations_from_tu(
     project_root: pathlib.Path,
     generated_root: pathlib.Path | None,
 ) -> list:
-    """Walk the AST and extract every METACC_TABLE / METACC_TABLE_ITEM
-    macro instantiation that belongs to a project source file.
+    """Walk the AST and extract every METACC marker macro instantiation
+    that belongs to a project source file.
     """
     annotations: list = []
     main = str(src_path.resolve())
@@ -1283,24 +1293,27 @@ def _flush_companion_fragments(
     for bucket in buckets.values():
         owner_path = bucket["owner_path"]
         h_path, c_path = companion_paths(owner_path, generated_root)
+        header_body = "\n\n".join(p for p in bucket["header_parts"] if p)
+        source_body = "\n\n".join(p for p in bucket["source_parts"] if p)
         h_text = _render_generated_header(
             h_path.name,
-            "\n\n".join(p for p in bucket["header_parts"] if p),
-        )
-        rel_owner = os.path.relpath(
-            owner_path.resolve(), c_path.parent
-        ).replace(os.sep, "/")
-        rel_generated_h = os.path.relpath(
-            h_path.resolve(), c_path.parent
-        ).replace(os.sep, "/")
-        c_text = _render_generated_source(
-            c_path.name,
-            rel_owner,
-            rel_generated_h,
-            "\n\n".join(p for p in bucket["source_parts"] if p),
+            header_body,
         )
         _write_if_changed(h_path, h_text)
-        _write_if_changed(c_path, c_text)
+        if source_body:
+            rel_owner = os.path.relpath(
+                owner_path.resolve(), c_path.parent
+            ).replace(os.sep, "/")
+            rel_generated_h = os.path.relpath(
+                h_path.resolve(), c_path.parent
+            ).replace(os.sep, "/")
+            c_text = _render_generated_source(
+                c_path.name,
+                rel_owner,
+                rel_generated_h,
+                source_body,
+            )
+            _write_if_changed(c_path, c_text)
 
 
 def annotation_location(ann: dict) -> str:
@@ -1311,6 +1324,138 @@ def annotation_location(ann: dict) -> str:
 
 def metacc_warning(message: str) -> None:
     print(f"[metacc] warning: {message}", file=sys.stderr)
+
+
+# ===========================================================================
+# METACC_ENUM / METACC_ENUM_ITEM code generator
+# ===========================================================================
+
+def is_c_identifier(token: str) -> bool:
+    return bool(C_IDENT_RE.fullmatch(token.strip()))
+
+
+def run_enum(
+    model: ProjectModel,
+    buckets: dict,
+    project_root: pathlib.Path,
+    generated_root: pathlib.Path | None,
+):
+    del project_root, generated_root
+    enums: dict = {}
+    for ann in model.annotations_of_kind("METACC_ENUM"):
+        args = ann["args"]
+        if not args:
+            metacc_warning(
+                f"METACC_ENUM at {annotation_location(ann)} needs "
+                f"at least the enum type"
+            )
+            continue
+        type_name = args[0].strip()
+        decl_loc = annotation_location(ann)
+        if not is_c_identifier(type_name):
+            metacc_warning(
+                f"METACC_ENUM at {decl_loc} has invalid enum type "
+                f"'{type_name}'; expected a C identifier"
+            )
+            continue
+        if type_name in enums:
+            old = enums[type_name]
+            if old["decl_loc"] == decl_loc and old["decl_args"] == args[1:]:
+                continue
+            metacc_warning(
+                f"duplicate METACC_ENUM '{type_name}' at "
+                f"{decl_loc} ignored; first declaration is "
+                f"at {enums[type_name]['decl_loc']}"
+            )
+            continue
+
+        kv = parse_kv_args(args[1:])
+        unknown_options = sorted(k for k in kv if k != "count")
+        for opt in unknown_options:
+            metacc_warning(
+                f"METACC_ENUM '{type_name}' at {decl_loc} has unknown "
+                f"option '{opt}'; ignored"
+            )
+        count_name = str(kv["count"]).strip() if "count" in kv else None
+        if count_name and not is_c_identifier(count_name):
+            metacc_warning(
+                f"METACC_ENUM '{type_name}' at {decl_loc} has invalid "
+                f"count name '{count_name}'; count item ignored"
+            )
+            count_name = None
+
+        enums[type_name] = {
+            "owner_src": ann.get("file", ann["src"]),
+            "decl_loc": decl_loc,
+            "decl_args": args[1:],
+            "count": count_name,
+            "items": [],
+            "item_names": set(),
+        }
+
+    for ann in model.annotations_of_kind("METACC_ENUM_ITEM"):
+        args = ann["args"]
+        if len(args) < 2:
+            metacc_warning(
+                f"METACC_ENUM_ITEM at {annotation_location(ann)} needs "
+                f"at least 2 args: type and enum constant"
+            )
+            continue
+        type_name = args[0].strip()
+        item_name = args[1].strip()
+        if not is_c_identifier(item_name):
+            metacc_warning(
+                f"METACC_ENUM_ITEM for '{type_name}' at "
+                f"{annotation_location(ann)} has invalid enum constant "
+                f"'{item_name}'; expected a C identifier"
+            )
+            continue
+        enum = enums.get(type_name)
+        if enum is None:
+            continue
+        if item_name in enum["item_names"]:
+            metacc_warning(
+                f"duplicate METACC_ENUM_ITEM '{item_name}' for "
+                f"'{type_name}' at {annotation_location(ann)} ignored"
+            )
+            continue
+        enum["item_names"].add(item_name)
+        enum["items"].append({
+            "name": item_name,
+            "src": ann.get("file", ann["src"]),
+            "line": ann["line"],
+        })
+
+    for type_name, enum in enums.items():
+        items = sorted(
+            enum["items"],
+            key=lambda x: (x["name"], str(x["src"]), int(x["line"])),
+        )
+        count_name = enum["count"]
+        if count_name and count_name in enum["item_names"]:
+            metacc_warning(
+                f"METACC_ENUM '{type_name}' count '{count_name}' duplicates "
+                f"an enum item; count item ignored"
+            )
+            count_name = None
+        if not items and not count_name:
+            metacc_warning(
+                f"METACC_ENUM '{type_name}' at {enum['decl_loc']} has no "
+                f"items; enum generation skipped"
+            )
+            continue
+
+        h_lines = ["typedef enum {"]
+        h_lines += [f"    {item['name']}," for item in items]
+        if count_name:
+            h_lines.append(f"    {count_name},")
+        h_lines.append(f"}} {type_name};")
+        _append_companion_fragment(
+            buckets,
+            pathlib.Path(enum["owner_src"]),
+            h_lines,
+            [],
+        )
 
 
 # ===========================================================================
@@ -1501,6 +1646,7 @@ def run(
     )
 
     companion_fragments: dict = {}
+    run_enum(model, companion_fragments, project_root, generated_root)
     run_table(model, companion_fragments, project_root, generated_root)
     _flush_companion_fragments(
         companion_fragments, generated_root
@@ -1527,10 +1673,33 @@ def run(
             f"undefined METACC_TABLE '{ann['args'][0]}'"
         )
 
-    if orphans:
+    # Detect orphan METACC_ENUM_ITEMs referencing undefined enums.
+    enum_types = {
+        a["args"][0]
+        for a in model.annotations_of_kind("METACC_ENUM")
+        if a["args"]
+    }
+    orphan_enum_items = [
+        a
+        for a in model.annotations_of_kind("METACC_ENUM_ITEM")
+        if a["args"] and a["args"][0] not in enum_types
+    ]
+    enum_orphans = {a["args"][0] for a in orphan_enum_items}
+    for ann in sorted(
+        orphan_enum_items,
+        key=lambda x: (x["args"][0], annotation_location(x)),
+    ):
+        metacc_warning(
+            f"METACC_ENUM_ITEM at {annotation_location(ann)} references "
+            f"undefined METACC_ENUM '{ann['args'][0]}'"
+        )
+
+    if orphans or enum_orphans:
         print(
             f"[metacc] Completed with {len(orphan_items)} undefined "
-            f"table item warning(s) across {len(orphans)} table(s).",
+            f"table item warning(s) across {len(orphans)} table(s), "
+            f"and {len(orphan_enum_items)} undefined enum item warning(s) "
+            f"across {len(enum_orphans)} enum(s).",
             file=sys.stderr,
         )
         return 1
@@ -1545,8 +1714,8 @@ def run(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="METACC_TABLE / METACC_TABLE_ITEM static-array "
-        "code generator for Embedded SDK",
+        description="METACC static-array / enum code generator "
+        "for Embedded SDK",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

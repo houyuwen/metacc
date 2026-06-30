@@ -26,28 +26,68 @@ extern const uint32_t my_table_count;
 
 ## 核心模型
 
-`metacc` 的核心模型很小：声明一张表，再从多个编译单元向这张表追加条目。
+`metacc` 的核心模型很小：声明一张生成物，再从多个编译单元向它追加条目。
 
-它主要由两个标记宏组成：
+它主要由四个标记宏组成：
 
 ```c
 METACC_TABLE(type, name, ...)
 METACC_TABLE_ITEM(name, ...)
+METACC_ENUM(type, ...)
+METACC_ENUM_ITEM(type, ...)
 ```
 
 其中：
 
 - `METACC_TABLE` 声明一张表，通常放在拥有该表类型定义的头文件里。
 - `METACC_TABLE_ITEM` 向表里追加一个条目，通常分散写在各个 `.c` 或测试 `.cpp` 翻译单元里。
+- `METACC_ENUM` 声明一个生成枚举类型。
+- `METACC_ENUM_ITEM` 向枚举追加一个枚举常量。
 - 工具会为每张表生成一个 `metacc_<owner>.h` 和 `metacc_<owner>.c`。
 - 生成的 `.c` 会包含表声明所在的 owner header，以及对应的 generated header。
 - 每张表生成两个符号：`const <type> <name>[]` 和 `const uint32_t <name>_count`。
+- 每个枚举生成一个 `typedef enum { ... } <type>;`，枚举项按常量名字符串排序，不显式赋值。
 
-为了让生成结果稳定、可读，业务侧推荐直接使用这两个原生标记宏。条目里引用的回调函数或对象保持外部可链接，生成文件就能像普通业务代码一样引用它们。
+为了让生成结果稳定、可读，业务侧推荐直接使用这些原生标记宏。条目里引用的回调函数或对象保持外部可链接，生成文件就能像普通业务代码一样引用它们。
 
-## 三个典型示例
+## 四个典型示例
 
-### 示例一: 模块初始化表
+### 示例一: 构建期枚举
+
+假设项目希望多个模块分散声明内部事件 ID，最终生成一份稳定排序的枚举定义。
+
+先在 owner header 里声明枚举类型：
+
+```c
+#pragma once
+
+#include "metacc.h"
+
+METACC_ENUM(eventbus_event_t, count = EVENTBUS_EVENT_COUNT)
+```
+
+然后任意 `.c` 文件都可以贡献枚举项：
+
+```c
+#include "eventbus_events.h"
+
+METACC_ENUM_ITEM(eventbus_event_t, EVENTBUS_EVENT_BETA)
+METACC_ENUM_ITEM(eventbus_event_t, EVENTBUS_EVENT_ALPHA)
+```
+
+构建后，`metacc` 会在 companion header 中生成：
+
+```c
+typedef enum {
+    EVENTBUS_EVENT_ALPHA,
+    EVENTBUS_EVENT_BETA,
+    EVENTBUS_EVENT_COUNT,
+} eventbus_event_t;
+```
+
+注意：默认枚举值由 C 编译器按顺序自增。按常量名排序只能保证生成结果可重复，不适合协议号、持久化 key 等跨版本必须稳定的外部 ID。
+
+### 示例二: 模块初始化表
 
 假设项目希望各个模块在自己的源文件里声明初始化入口，最终由构建系统生成一张按优先级排序的启动表。
 
@@ -109,7 +149,7 @@ for (uint32_t i = 0; i < module_init_count; ++i) {
 }
 ```
 
-### 示例二: 设备树 provider 表
+### 示例三: 设备树 provider 表
 
 另一个常见场景是设备树或板级设备表。每个板级文件静态定义自己的设备实例，再提供一个 provider 函数按索引返回设备。平台层只关心最终生成的 provider 表，不需要知道这些 provider 分散在哪些源文件里。
 
@@ -142,7 +182,7 @@ METACC_TABLE_ITEM(
 
 这个例子里，`metacc` 解决的是板级解耦问题。新增一个设备 provider 时，不需要修改中心数组；provider 写在对应板级文件里，构建期自动进入 `device_tree[]`。
 
-### 示例三: 事件总线订阅表
+### 示例四: 事件总线订阅表
 
 事件总线适合拓扑相对固定的内部事件，例如链路状态变化、传感器数据到达、模块健康状态更新。每个模块在自己的源文件里声明订阅关系，构建期生成最终订阅表。
 
@@ -228,6 +268,33 @@ METACC_TABLE_ITEM(module_init, 20, "device", device_init, device_exit)
 const module_init_entry_t module_init[] = {
     {20, "device", device_init, device_exit},
 };
+```
+
+### METACC_ENUM
+
+```c
+METACC_ENUM(enum_type, count = ENUM_COUNT)
+```
+
+第一个参数是生成的枚举类型名，必须是 C 标识符。
+
+可选参数：
+
+- `count`：可选的末尾计数枚举项名，例如 `EVENTBUS_EVENT_COUNT`。不传就不生成 count 项。
+
+### METACC_ENUM_ITEM
+
+```c
+METACC_ENUM_ITEM(enum_type, ENUM_ITEM_NAME)
+```
+
+第一个参数是目标枚举类型名，第二个参数是枚举常量名。所有枚举常量会按常量名字符串排序输出，生成器不写显式数值：
+
+```c
+typedef enum {
+    ENUM_ITEM_ALPHA,
+    ENUM_ITEM_BETA,
+} enum_type;
 ```
 
 ## 为什么不用运行时注册

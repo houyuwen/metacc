@@ -45,6 +45,8 @@ extern "C" {
 /* Exported macro ------------------------------------------------------------*/
 #define METACC_TABLE(type, name, ...)      /* metacc:table       */
 #define METACC_TABLE_ITEM(name, ...)       /* metacc:table_item  */
+#define METACC_ENUM(type, ...)            /* metacc:enum        */
+#define METACC_ENUM_ITEM(type, ...)       /* metacc:enum_item   */
 
 /* Exported functions --------------------------------------------------------*/
 #ifdef __cplusplus

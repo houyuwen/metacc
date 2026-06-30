@@ -86,7 +86,7 @@ del _configure_libclang_path
 # ---------------------------------------------------------------------------
 # constants
 # ---------------------------------------------------------------------------
-CACHE_VERSION = 15  # bumped: collect prototypes inside C++ linkage blocks
+CACHE_VERSION = 16  # bumped: METACC_TABLE argument order is type, name
 
 METACC_MACROS = {"METACC_TABLE", "METACC_TABLE_ITEM"}
 METACC_TEXT_RE = re.compile(r"\b(?:METACC_TABLE|METACC_TABLE_ITEM)\b")
@@ -1329,10 +1329,10 @@ def run_table(
         if len(args) < 2:
             metacc_warning(
                 f"METACC_TABLE at {annotation_location(ann)} needs at "
-                f"least 2 args: name and type"
+                f"least 2 args: type and name"
             )
             continue
-        name, type_name = args[0], args[1]
+        type_name, name = args[0], args[1]
         decl_loc = annotation_location(ann)
         if name in tables:
             old = tables[name]
@@ -1508,9 +1508,9 @@ def run(
 
     # Detect orphan METACC_TABLE_ITEMs referencing undefined tables.
     table_names = {
-        a["args"][0]
+        a["args"][1]
         for a in model.annotations_of_kind("METACC_TABLE")
-        if a["args"]
+        if len(a["args"]) >= 2
     }
     orphan_items = [
         a

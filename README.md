@@ -31,7 +31,7 @@ extern const uint32_t my_table_count;
 它主要由两个标记宏组成：
 
 ```c
-METACC_TABLE(name, type, ...)
+METACC_TABLE(type, name, ...)
 METACC_TABLE_ITEM(name, ...)
 ```
 
@@ -66,7 +66,7 @@ typedef struct {
     void (*exit)(void);
 } module_init_entry_t;
 
-METACC_TABLE(module_init, module_init_entry_t, sort_col = 0, order = asc)
+METACC_TABLE(module_init_entry_t, module_init, sort_col = 0, order = asc)
 ```
 
 然后任意 `.c` 文件都可以贡献条目：
@@ -123,7 +123,7 @@ typedef struct {
     plat_device_provider_t provider;
 } plat_devicetree_provider_entry_t;
 
-METACC_TABLE(device_tree, plat_devicetree_provider_entry_t, sort_col = 0, order = asc)
+METACC_TABLE(plat_devicetree_provider_entry_t, device_tree, sort_col = 0, order = asc)
 ```
 
 某个板级文件贡献自己的 UART provider：
@@ -155,7 +155,7 @@ typedef struct eventbus_subscriber {
     void *user_data;
 } eventbus_subscriber_t;
 
-METACC_TABLE(eventbus_subscribers, eventbus_subscriber_t, sort_col = 0, order = asc)
+METACC_TABLE(eventbus_subscriber_t, eventbus_subscribers, sort_col = 0, order = asc)
 ```
 
 任意模块可以在自己的翻译单元里追加订阅者：
@@ -177,7 +177,7 @@ METACC_TABLE_ITEM(eventbus_subscribers, EVENTBUS_EVENT_BETA, beta_cb, NULL)
 ### METACC_TABLE
 
 ```c
-METACC_TABLE(table_name, item_type, sort_col = 0, order = asc)
+METACC_TABLE(item_type, table_name, sort_col = 0, order = asc)
 ```
 
 前两个参数是必需的。
@@ -458,7 +458,7 @@ tools/metacc/release/metacc --help
 例如：
 
 ```c
-METACC_TABLE(my_table, item_t)
+METACC_TABLE(item_t, my_table)
 METACC_TABLE_ITEM(my_tabel, 1, 2, 3)  /* 拼写错了 */
 ```
 

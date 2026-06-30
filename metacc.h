@@ -43,7 +43,7 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* Exported constants --------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/
-#define METACC_TABLE(name, type, ...)      /* metacc:table       */
+#define METACC_TABLE(type, name, ...)      /* metacc:table       */
 #define METACC_TABLE_ITEM(name, ...)       /* metacc:table_item  */
 
 /* Exported functions --------------------------------------------------------*/

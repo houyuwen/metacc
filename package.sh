@@ -2,11 +2,11 @@
 # ==============================================================================
 # package.sh - Nuitka 高兼容单层扁平化打包脚本 (v10)
 # 所有产物（执行文件、Nuitka 依赖 .so、打包机 libclang、metacc.h）
-# 全部平铺放进 release/ 文件夹下。
-# 发布结构：tools/metacc/release/
+# 全部平铺放进 metacc/ 文件夹下。
+# 发布结构：tools/metacc/metacc/
 #   metacc          <- Nuitka 编译的可执行文件
 #   metacc.h        <- 运行时需要的注释宏头文件
-#   libclang.so     <- 打包机 libclang（与 release/ 内其他 .so 共存）
+#   libclang.so     <- 打包机 libclang（与 metacc/ 内其他 .so 共存）
 #   *.so            <- Nuitka 依赖的 Python 标准库 .so
 # 编译完成后自动清理所有临时过程文件。
 # ==============================================================================
@@ -15,8 +15,8 @@ set -e
 # 确保脚本在其所在目录下绝对对齐执行，并定位项目根目录
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CDPATH="" cd -- "$SCRIPT_DIR"
-# 发布产物目标目录（Nuitka standalone 平铺到 release/）
-METACC_DIST_DIR="$SCRIPT_DIR/release"
+# 发布产物目标目录（Nuitka standalone 平铺到 metacc/）
+METACC_DIST_DIR="$SCRIPT_DIR/metacc"
 
 echo "=============================================================================="
 echo "[metacc-pack] Starting Pure Single-Folder Standalone Compilation Flow..."
@@ -58,7 +58,7 @@ python3 -m nuitka \
     --output-filename=metacc \
     metacc.py
 
-# 整理产物：将独立目录内的所有文件全平铺转移到 release/ 中
+# 整理产物：将独立目录内的所有文件全平铺转移到 metacc/ 中
 echo "[metacc-pack] Moving all standalone artifacts directly to $METACC_DIST_DIR/..."
 mv build_tmp/metacc.dist/* "$METACC_DIST_DIR/"
 
@@ -71,7 +71,7 @@ fi
 
 echo ""
 echo "------------------------------------------------------------------------------"
-echo "[Step 2/4] Copying metacc.h into release/..."
+echo "[Step 2/4] Copying metacc.h into metacc/..."
 echo "------------------------------------------------------------------------------"
 
 if [ -f "$SCRIPT_DIR/metacc.h" ]; then
@@ -110,7 +110,7 @@ print(found)
 if [ -n "$HOST_LIBCLANG" ] && [ -f "$HOST_LIBCLANG" ]; then
     echo "[metacc-pack] Found active host libclang: $HOST_LIBCLANG"
 
-    # 复制到 release/（打包产物开箱即用）
+    # 复制到 metacc/（打包产物开箱即用）
     echo "[metacc-pack] Copying libclang to $METACC_DIST_DIR/libclang.so ..."
     cp "$HOST_LIBCLANG" "$METACC_DIST_DIR/libclang.so"
     rm -f "$METACC_DIST_DIR"/libclang-*.so*
@@ -118,7 +118,7 @@ if [ -n "$HOST_LIBCLANG" ] && [ -f "$HOST_LIBCLANG" ]; then
     echo ">> [SUCCESS] libclang placed at $METACC_DIST_DIR/libclang.so"
 else
     echo "[metacc-pack] WARNING: Could not automatically locate libclang on this machine." >&2
-    echo "[metacc-pack] Please manually copy your local libclang to release/libclang.so later if needed." >&2
+    echo "[metacc-pack] Please manually copy your local libclang to metacc/libclang.so later if needed." >&2
 fi
 
 echo ""
@@ -134,6 +134,6 @@ echo "==========================================================================
 echo "[metacc-pack] PACKAGING COMPLETED SUCCESSFULLY!"
 echo ">> 发布目录:       $METACC_DIST_DIR/"
 echo ">> 可执行入口:     $METACC_DIST_DIR/metacc"
-echo ">> 运行命令:       tools/metacc/release/metacc -c <compile_commands> -p <project_root>"
+echo ">> 运行命令:       tools/metacc/metacc/metacc -c <compile_commands> -p <project_root>"
 echo ">> 运行时依赖:     $METACC_DIST_DIR/libclang.so  (all .so files co-located)"
 echo "=============================================================================="
